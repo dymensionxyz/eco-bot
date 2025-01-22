@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
+	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
@@ -13,16 +15,18 @@ import (
 )
 
 type querier struct {
-	client     cosmosClient
-	httpClient http.Client
-	chainID    string
+	client       cosmosClient
+	httpClient   http.Client
+	chainID      string
+	analyticsURL string
 }
 
-func newQuerier(client cosmosClient) querier {
+func newQuerier(client cosmosClient, analyticsURL string) querier {
 	return querier{
-		client:     client,
-		httpClient: http.Client{},
-		chainID:    "dymension_1405-1",
+		client:       client,
+		httpClient:   http.Client{},
+		chainID:      client.Context().ChainID,
+		analyticsURL: analyticsURL,
 	}
 }
 
@@ -37,23 +41,39 @@ func (q querier) queryIROPlan(ctx context.Context, id string) (*types.Plan, erro
 	return resp.Plan, nil
 }
 
-// TODO: pagination
+// TODO: use analytics or indexer API instead of RPC
 func (q querier) queryIROPlans(ctx context.Context) ([]types.Plan, error) {
 	c := types.NewQueryClient(q.client.Context())
 	resp, err := c.QueryPlans(ctx, &types.QueryPlansRequest{
-		TradableOnly: true,
+		NonSettledOnly: true,
+		Pagination:     nil, // TODO: pagination
 	})
 	if err != nil {
 		return nil, fmt.Errorf("query plans: %w", err)
 	}
+
+	now := time.Now()
 
 	var plans []types.Plan
 	for _, p := range resp.Plans {
 		if p.SettledDenom != "" {
 			continue
 		}
+		if p.StartTime.After(now) {
+			continue
+		}
 		plans = append(plans, p)
 	}
+
+	slices.SortFunc(plans, func(p1, p2 types.Plan) int {
+		if p1.Id > p2.Id {
+			return 1
+		}
+		if p1.Id < p2.Id {
+			return -1
+		}
+		return 0
+	})
 
 	return plans, nil
 }
@@ -94,11 +114,8 @@ func (q querier) queryBalances(ctx context.Context, address string) (sdk.Coins, 
 	return resp.Balances, nil
 }
 
-// TODO: from config
-const analyticsURL = "https://fetchnetworkdataitemrequest-zbrmx4rjia-uc.a.run.app/?networkId=%s&dataType=rollapps&itemId=%s"
-
 func (q querier) queryAnalytics(rollappID string) (*analyticsResp, error) {
-	url := fmt.Sprintf(analyticsURL, q.chainID, rollappID)
+	url := fmt.Sprintf("%s?networkId=%s&dataType=rollapps&itemId=%s", q.analyticsURL, q.chainID, rollappID)
 	resp, err := get[analyticsResp](q.httpClient, url)
 	if err != nil {
 		return nil, fmt.Errorf("query analytics: %w", err)

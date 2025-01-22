@@ -2,17 +2,15 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"math/big"
+	"io/fs"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/cosmos/cosmos-sdk/types/bech32"
-	"github.com/cosmos/cosmos-sdk/x/authz"
 	"github.com/dymensionxyz/cosmosclient/cosmosclient"
 	"go.uber.org/zap"
 
@@ -20,18 +18,20 @@ import (
 )
 
 type trader struct {
-	account               account
-	client                cosmosClient
-	balancesIRORollappMap map[string]sdk.Int
-	balanceDYM            sdk.Int
-	bmu                   sync.Mutex
-	NAV                   sdk.Int // net asset value of all positions in DYM
-	q                     querier
-	iteratePlans          func(func(types.Plan) error) error
-	positions             map[uint64]position
-	policyAddress         string
-	operatorAddress       string
-	logger                *zap.Logger
+	accountSvc             *accountService
+	client                 cosmosClient
+	NAV                    sdk.Int // net asset value of all positions in DYM
+	q                      querier
+	iteratePlans           func(func(types.Plan) error) error
+	positions              map[uint64]position
+	getState               func() (*state, error)
+	setState               func(*state) error
+	buy                    func(context.Context, sdk.Int, sdk.Int, string) error
+	sell                   func(context.Context, sdk.Int, sdk.Int, string) error
+	getBalances            func(context.Context) (sdk.Coins, error)
+	balanceDYM             func() sdk.Int
+	positionManageInterval time.Duration
+	logger                 *zap.Logger
 }
 
 type position struct {
@@ -45,79 +45,82 @@ type cosmosClient interface {
 	Context() client.Context
 }
 
+type plan interface {
+	GetId() uint64
+	GetRollappId() string
+	TargetRaise() sdk.Int
+	TotalSoldInDYM() sdk.Int
+	SpotPrice() sdk.Dec
+	MinIncome(sdk.Int) sdk.Int
+	MinAmount(sdk.Int) (sdk.Int, error)
+}
+
 var (
-	DYM = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	// DYM                 = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	standardTargetRaise = sdk.NewDec(10000)
 )
 
+const coolDownPeriod = 12 * time.Hour
+
 func newTrader(
-	acc account,
+	accountSvc *accountService,
 	q querier,
 	iteratePlans func(func(types.Plan) error) error,
-	policyAddress,
-	operatorAddress string,
 	cClient cosmosClient,
+	getState func() (*state, error),
+	setState func(*state) error,
+	positionManageInterval time.Duration,
 	logger *zap.Logger,
 ) *trader {
-	return &trader{
-		client:                cClient,
-		q:                     q,
-		iteratePlans:          iteratePlans,
-		account:               acc,
-		positions:             make(map[uint64]position),
-		balancesIRORollappMap: make(map[string]sdk.Int),
-		policyAddress:         policyAddress,
-		operatorAddress:       operatorAddress,
-		logger:                logger,
+	t := &trader{
+		accountSvc:             accountSvc,
+		client:                 cClient,
+		q:                      q,
+		iteratePlans:           iteratePlans,
+		positions:              make(map[uint64]position),
+		getState:               getState,
+		setState:               setState,
+		positionManageInterval: positionManageInterval,
+		logger:                 logger.With(zap.String("trader", accountSvc.accountName)),
+		NAV:                    sdk.NewInt(0),
 	}
+	t.buy = t.buyAmount
+	t.sell = t.sellAmount
+	t.getBalances = t.accountSvc.getAccountBalances
+	t.balanceDYM = t.balanceOfDYM
+	return t
 }
 
 // loadPositions gets all the balances for the trader account and loads all the plans,
 // it then matches all the balances with plans by rollapp id and maps a position for each plan
 func (t *trader) loadPositions(ctx context.Context) error {
-	if err := t.updateBalances(ctx); err != nil {
+	if err := t.accountSvc.refreshBalances(ctx); err != nil {
 		return fmt.Errorf("failed to update balances: %w", err)
 	}
 
-	if err := t.updatePlans(ctx); err != nil {
+	if err := t.updatePlans(); err != nil {
 		return fmt.Errorf("failed to update plans: %w", err)
 	}
 
-	return nil
-}
-
-func (t *trader) updateBalances(ctx context.Context) error {
-	balances, err := t.q.queryBalances(ctx, t.account.Address)
-	if err != nil {
-		return fmt.Errorf("failed to query balances: %w", err)
+	positionPlanIDs := make([]uint64, 0, len(t.positions))
+	for planID := range t.positions {
+		positionPlanIDs = append(positionPlanIDs, planID)
 	}
 
-	t.bmu.Lock()
-	defer t.bmu.Unlock()
+	slices.Sort(positionPlanIDs)
 
-	for _, balance := range balances {
-		if !strings.HasPrefix(balance.Denom, IROTokenPrefix) {
-			if balance.Denom == "adym" {
-				t.balanceDYM = balance.Amount
-			}
-			continue
-		}
-		rollappID := strings.TrimPrefix(balance.Denom, IROTokenPrefix)
-		t.balancesIRORollappMap[rollappID] = balance.Amount
-	}
+	t.logger.Info("open positions", zap.Uint64s("plan_ids", positionPlanIDs))
 
 	return nil
 }
 
-func (t *trader) updatePlans(ctx context.Context) error {
-	// get plans
-	plans, err := t.q.queryIROPlans(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to query plans: %w", err)
-	}
-
+func (t *trader) updatePlans() error {
 	// position is a plan with a balance
-	for _, plan := range plans {
-		if b, ok := t.balancesIRORollappMap[plan.RollappId]; ok {
+	t.NAV = sdk.NewInt(0)
+
+	if err := t.iteratePlans(func(plan types.Plan) error {
+		b := t.accountSvc.balanceOf(IRODenom(plan.RollappId))
+		if b.IsPositive() {
 			price := plan.SpotPrice()
 			valueDYM := sdk.NewDecFromInt(b).Mul(price).RoundInt()
 			t.positions[plan.Id] = position{
@@ -126,6 +129,9 @@ func (t *trader) updatePlans(ctx context.Context) error {
 			}
 			t.NAV = t.NAV.Add(valueDYM)
 		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to iterate plans: %w", err)
 	}
 
 	return nil
@@ -134,193 +140,389 @@ func (t *trader) updatePlans(ctx context.Context) error {
 // managePositions periodically traverses all the positions and applies logic to manage them by trading.
 // logic is applied to decide what to do with current positions, and if any new positions should be opened.
 func (t *trader) managePositions() {
+	s, err := t.getState()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			s = &state{
+				Positions: make(map[string]positionState),
+			}
+			if err := t.setState(s); err != nil {
+				t.logger.Error("failed to set state", zap.Error(err))
+				return
+			}
+		} else {
+			t.logger.Error("failed to get state", zap.Error(err))
+			return
+		}
+	}
+
 	ctx := context.Background()
-	ticker := time.NewTicker(5 * time.Second)
+
+	if err := t.positionsRun(ctx); err != nil {
+		t.logger.Error("failed to run positions", zap.Error(err))
+	}
+
+	ticker := time.NewTicker(t.positionManageInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := t.loadPositions(ctx); err != nil {
-				t.logger.Error("failed to load positions", zap.Error(err))
-				continue
-			}
-
-			err := t.iteratePlans(func(plan types.Plan) error {
-				analytics, err := t.q.queryAnalytics(plan.RollappId)
-				if err != nil {
-					return fmt.Errorf("failed to query analytics: %w", err)
-				}
-
-				_ = analytics
-
-				// if position exists for the trader
-				if pos, ok := t.positions[plan.Id]; ok {
-					return t.manageExistingPosition(plan.Id, ctx, pos)
-				}
-
-				return t.tryOpenNewPosition(plan.Id, ctx)
-			})
-			if err != nil {
-				t.logger.Error("failed to iterate plans", zap.Error(err))
-				continue
+			if err := t.positionsRun(ctx); err != nil {
+				t.logger.Error("failed to run positions", zap.Error(err))
 			}
 		}
 	}
 }
 
-func (t *trader) tryOpenNewPosition(planID uint64, ctx context.Context) error {
-	// if position doesn't exist, open a new one
-	// get the amount of DYM to spend
-	tokens, err := t.q.queryTokensForDYM(ctx, fmt.Sprint(planID), sdk.NewInt(1))
-	if err != nil {
-		t.logger.Error("failed to query tokens for DYM", zap.Error(err))
-		return nil
+func (t *trader) positionsRun(ctx context.Context) error {
+	if err := t.loadPositions(ctx); err != nil {
+		return fmt.Errorf("failed to load positions: %w", err)
 	}
 
-	_ = tokens
+	err := t.iteratePlans(func(plan types.Plan) error {
+		analytics, err := t.q.queryAnalytics(plan.RollappId)
+		if err != nil {
+			return fmt.Errorf("failed to query analytics: %w", err)
+		}
+
+		// if position exists for the trader
+		if pos, ok := t.positions[plan.Id]; ok {
+			return t.manageExistingPosition(
+				ctx, &plan, pos,
+				analytics.Volume.oneDayChangeInPercent(),
+				analytics.TotalSupply.oneDayPriceChangeInPercent(),
+			)
+		}
+
+		return t.tryOpenNewPosition(&plan, ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to iterate plans: %w", err)
+	}
+	return nil
+}
+
+/*
+TODO:
+  - how to get totalPortfolioValue ?
+  - introduce configurable parameters for percentages for allocation
+  - will previously closed positions be opened again???
+*/
+func (t *trader) tryOpenNewPosition(plan plan, ctx context.Context) error {
+	// ===== decide how much to allocate based on the target raise of the IRO =====
+	targetRaise := sdk.NewDecFromInt(plan.TargetRaise())
+	toAllocateTRPercent := sdk.NewDec(0)
+
+	// If standard 0.05%
+	if targetRaise.Equal(standardTargetRaise) {
+		toAllocateTRPercent = sdk.MustNewDecFromStr("0.05")
+		// if lower than standard 0.1%
+	} else if targetRaise.LT(standardTargetRaise) {
+		toAllocateTRPercent = sdk.MustNewDecFromStr("0.1")
+		// if higher than standard 0.02%
+	} else {
+		toAllocateTRPercent = sdk.MustNewDecFromStr("0.02")
+	}
+
+	// ===== decide how much to allocate based on the amount of DYM bought before the bot got to it =====
+	toAllocateSDPercent := sdk.NewDec(0)
+
+	totalSoldDYM := plan.TotalSoldInDYM()
+	// if nobody or less 1 DYM → buy 0.05% (from portfolio size)
+	if totalSoldDYM.LT(sdk.NewInt(1)) {
+		toAllocateSDPercent = sdk.MustNewDecFromStr("0.05")
+		// if above 100 DYM  → buy 0.02%
+	} else if totalSoldDYM.GT(sdk.NewInt(100)) {
+		toAllocateSDPercent = sdk.MustNewDecFromStr("0.02")
+	} else {
+		// if between 1 - 100 DYM → buy 0.5%
+		toAllocateSDPercent = sdk.MustNewDecFromStr("0.5")
+	}
+
+	toAllocatePercent := toAllocateTRPercent
+	if toAllocateSDPercent.GT(toAllocateTRPercent) {
+		toAllocatePercent = toAllocateSDPercent
+	}
+	totalPortfolioValue := sdk.NewDecFromInt(t.NAV).Add(sdk.NewDecFromInt(t.balanceDYM()))
+
+	if err := t.ensureAccountIsPrimed(ctx, totalPortfolioValue); err != nil {
+		return fmt.Errorf("failed to ensure account is primed: %w", err)
+	}
+
+	amountToAllocate := totalPortfolioValue.Mul(toAllocatePercent).RoundInt()
+	tokenAmount := sdk.NewDecFromInt(amountToAllocate).Quo(plan.SpotPrice())
+
+	t.logger.Info("opening new position", zap.Uint64("plan_id", plan.GetId()), zap.String("amount_to_allocate", amountToAllocate.String()), zap.String("token_amount", tokenAmount.String()))
+
+	if err := t.buy(ctx, amountToAllocate, sdk.NewInt(1), fmt.Sprint(plan.GetId())); err != nil {
+		return fmt.Errorf("failed to buy: %w", err)
+	}
+
+	t.positions[plan.GetId()] = position{
+		valueDYM:  amountToAllocate,
+		amount:    tokenAmount.RoundInt(),
+		createdAt: time.Now(),
+	}
+
+	st, err := t.getState()
+	if err != nil {
+		return fmt.Errorf("failed to get state: %w", err)
+	}
+
+	st.Positions[fmt.Sprint(plan.GetId())] = positionState{
+		LastVolumeCheck: time.Now().Unix(),
+		LastPriceCheck:  time.Now().Unix(),
+	}
+
+	if err := t.setState(st); err != nil {
+		return fmt.Errorf("failed to set state: %w", err)
+	}
 
 	return nil
 }
 
-func (t *trader) manageExistingPosition(planID uint64, ctx context.Context, pos position) error {
-	plan, err := t.q.queryIROPlan(ctx, fmt.Sprint(planID))
+func (t *trader) ensureAccountIsPrimed(ctx context.Context, totalPortfolioValue sdk.Dec) error {
+	// if the portfolio is empty, the allocated amount will be 0
+	// so, we can prime the account with some DYM
+	if !totalPortfolioValue.IsPositive() {
+		t.logger.Info("account is empty, priming with 1DYM")
+		amountToPrime := sdk.NewInt(1000000000000000000) // 1DYM
+		ensuredDenoms, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins(sdk.NewCoin("adym", amountToPrime)))
+		if err != nil {
+			return fmt.Errorf("failed to ensure balances: %w", err)
+		}
+
+		if len(ensuredDenoms) == 0 {
+			t.logger.Info("account not primed")
+			return nil
+		}
+	}
+	return nil
+}
+
+/*
+TODO:
+  - introduce configurable parameters for percentages
+*/
+func (t *trader) manageExistingPosition(
+	ctx context.Context,
+	plan plan,
+	pos position,
+	oneDayVolumeChangeInPercent, oneDayPriceChangeInPercent float64,
+) error {
+	planID := plan.GetId()
+	valueInDYM := sdk.NewDecFromInt(pos.amount).Mul(plan.SpotPrice())
+	balanceDym := sdk.NewDecFromInt(t.balanceDYM())
+	nav := sdk.NewDecFromInt(t.NAV)
+	percentage := valueInDYM.Quo(nav.Add(balanceDym))
+	valParts := strings.Split(valueInDYM.String(), ".")
+	valInDYMStr := fmt.Sprintf("%s.%s", valParts[0], valParts[1][:2])
+	percParts := strings.Split(percentage.Mul(sdk.NewDec(100)).String(), ".")
+	percentageStr := fmt.Sprintf("%s.%s", percParts[0], percParts[1][:2])
+
+	t.logger.Debug("managing existing position",
+		zap.Uint64("plan_id", planID),
+		zap.String("value_in_dym", valInDYMStr),
+		zap.String("percentage", fmt.Sprintf("%s", percentageStr)),
+		zap.String("NAV", t.NAV.String()))
+
+	st, err := t.getState()
 	if err != nil {
-		t.logger.Error("failed to get plan", zap.Error(err))
 		return err
 	}
 
-	// buy or sell
+	s := st.Positions[fmt.Sprint(planID)]
+	now := time.Now().Unix()
+	nextVolumeCheck := s.LastVolumeCheck + int64(coolDownPeriod.Seconds())
+	nextPriceCheck := s.LastPriceCheck + int64(coolDownPeriod.Seconds())
+	sellAmt := sdk.NewInt(0)
 
-	valueInDYM := sdk.NewDecFromInt(pos.amount).Mul(plan.SpotPrice())
-	percentage := valueInDYM.Quo(sdk.NewDecFromInt(t.NAV))
-
+	// sell
+	switch {
 	// If a token's value increases beyond 10% of total portfolio value- > sell gradually excess to return to 10%.
-	if percentage.GT(sdk.MustNewDecFromStr("0.1")) {
-		// get the amount to sell (every time 1%)
-		amt := valueInDYM.Mul(sdk.MustNewDecFromStr("0.01")).Quo(plan.SpotPrice()).RoundInt()
-
-		// get the min income
-		minIncome := amt.Quo(sdk.NewInt(5)) // make min income half the amount
-
-		// sell
-		if err = t.sellAuthorized(amt, minIncome, fmt.Sprint(planID)); err != nil {
-			t.logger.Error("failed to sell", zap.Error(err))
-			return err
-		}
-
-		return nil
-	}
-
+	case percentage.GT(sdk.MustNewDecFromStr("0.1")):
+		t.logger.Info("token's value increased beyond 10% of total portfolio value, selling gradually to return to 10%",
+			zap.Uint64("plan_id", planID),
+			zap.String("percentage", fmt.Sprintf("%s", percentage.Mul(sdk.NewDec(100)).String())))
+		// get the amount to sell (every time 2%)
+		sellAmt = sdk.NewDecFromInt(pos.amount).Mul(sdk.MustNewDecFromStr("0.02")).RoundInt()
 	// If a token's value drops below 0.05% of total portfolio value sell the entire position.
-	if percentage.LT(sdk.MustNewDecFromStr("0.0005")) {
-		// sell the entire position
-		if err = t.sellAuthorized(pos.amount, pos.valueDYM, fmt.Sprint(planID)); err != nil {
-			t.logger.Error("failed to sell", zap.Error(err))
-			return err
+	case percentage.LT(sdk.MustNewDecFromStr("0.0005")):
+		t.logger.Info("token's value dropped below 0.05% of total portfolio value, selling entire position",
+			zap.Uint64("plan_id", planID),
+			zap.String("percentage", fmt.Sprintf("%s", percentage.Mul(sdk.NewDec(100)).String())))
+
+		balances, err := t.getBalances(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get account balances: %w", err)
 		}
 
+		sellAmt = balances.AmountOf(IRODenom(plan.GetRollappId()))
+		delete(t.positions, planID)
+	// If volume decreases >50%, decrease position by 10% of current size.
+	case nextVolumeCheck <= now && oneDayVolumeChangeInPercent <= -50:
+		t.logger.Info("volume decreased >50%, decreasing position by 10%",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_change_in_percent", oneDayVolumeChangeInPercent))
+		sellAmt = pos.amount.Quo(sdk.NewInt(10))
+		s.LastVolumeCheck = now
+	// Implement a trailing stop-loss of 50% for each token position.
+
+	// if token dropped in 25% price → sell 50%.
+	case nextPriceCheck <= now && oneDayPriceChangeInPercent <= -25:
+		t.logger.Info("token dropped in 25% price, selling 50% of position",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
+		// get the amount to sell (every time 50%)
+		sellAmt = pos.amount.Mul(sdk.NewInt(50)).Quo(sdk.NewInt(100))
+		s.LastPriceCheck = now
+	// If price decreases >10%, decrease position by 10% of current size.
+	case nextPriceCheck <= now && oneDayPriceChangeInPercent <= -10:
+		t.logger.Info("price decreases >10%, decreasing position by 10%",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
+		// get the amount to sell (every time 10%)
+		sellAmt = pos.amount.Quo(sdk.NewInt(10))
+		s.LastPriceCheck = now
+	// Take profits on individual tokens that have gained > 200% by selling 25% the position.
+	case nextPriceCheck <= now && oneDayPriceChangeInPercent > 200:
+		t.logger.Info("token have gained > 200%, selling 25% of position",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
+		sellAmt = pos.amount.Mul(sdk.NewInt(25)).Quo(sdk.NewInt(100))
+		s.LastPriceCheck = now
+	}
+
+	if sellAmt.GT(sdk.ZeroInt()) {
+		if err := t.sell(ctx, sellAmt, plan.MinIncome(sellAmt), fmt.Sprint(planID)); err != nil {
+			return fmt.Errorf("failed to sell: planID %d; %w", planID, err)
+		}
+
+		st.Positions[fmt.Sprint(planID)] = s
+		if err := t.setState(st); err != nil {
+			return fmt.Errorf("failed to set state: %w", err)
+		}
 		return nil
 	}
 
-	// TODO: check volume change and buy/sell accordingly
+	// Only execute (buy) trade if (Current DYM reserves / Total portfolio value) > 0.2
+	dymReserveToTotalPortfolio := balanceDym.Quo(nav)
+	if !dymReserveToTotalPortfolio.GT(sdk.MustNewDecFromStr("0.2")) {
+		return nil
+	}
+
+	// buy
+
+	buyAmt := sdk.NewDec(0)
+
+	switch {
+	// If volume increases >50% on a daily normalized timeframe, increase position by 10% of current size.
+	case nextVolumeCheck <= now && oneDayVolumeChangeInPercent > 50:
+		t.logger.Info("volume increased >50%, increasing position by 10%",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_change_in_percent", oneDayVolumeChangeInPercent))
+		// get the amount to buy (every time 10%)
+		buyAmt = sdk.NewDecFromInt(pos.amount.Quo(sdk.NewInt(10)))
+		s.LastVolumeCheck = now
+	// If price increases >10% on a daily normalized timeframe, increase position by 10% of current size.
+	case nextPriceCheck <= now && oneDayPriceChangeInPercent > 10:
+		t.logger.Info("price increased >10%, increasing position by 10%",
+			zap.Uint64("plan_id", planID),
+			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
+		// get the amount to buy (every time 10%)
+		buyAmt = sdk.NewDecFromInt(pos.amount.Quo(sdk.NewInt(10)))
+		s.LastVolumeCheck = now
+	}
+
+	if !buyAmt.IsPositive() {
+		return nil
+	}
+
+	spend := buyAmt.Mul(plan.SpotPrice()).RoundInt()
+	minAmount, err := plan.MinAmount(spend)
+	if err != nil {
+		return fmt.Errorf("failed to get min amount: %w", err)
+	}
+
+	// buy
+	if err = t.buy(ctx, spend, minAmount, fmt.Sprint(planID)); err != nil {
+		return fmt.Errorf("failed to buy: planID %d; %w", planID, err)
+	}
+
+	st.Positions[fmt.Sprint(planID)] = s
+	if err := t.setState(st); err != nil {
+		return fmt.Errorf("failed to set state: %w", err)
+	}
 
 	return nil
 }
 
-func (t *trader) buyAuthorized(spend, minAmount sdk.Int, planID string) error {
+func (t *trader) buyAmount(ctx context.Context, spend, minAmount sdk.Int, planID string) error {
+	toppedUp, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins(sdk.NewCoin("adym", spend)))
+	if err != nil {
+		return fmt.Errorf("failed to ensure balances: %w", err)
+	}
+
+	if len(toppedUp) == 0 {
+		t.logger.Info("balances not topped up")
+		return nil
+	}
+
 	buyMsg := &types.MsgBuyExactSpend{
-		Buyer:              t.operatorAddress,
+		Buyer:              t.accountSvc.address(),
 		PlanId:             planID,
 		Spend:              spend,
 		MinOutTokensAmount: minAmount,
 	}
 
-	return t.execAuthorized(buyMsg)
+	tx, err := t.client.BroadcastTx(t.accountSvc.accountName, buyMsg)
+	if err != nil {
+		return fmt.Errorf("failed to broadcast tx: %w", err)
+	}
+
+	if _, err := waitForTx(t.accountSvc.client, tx.TxHash); err != nil {
+		return fmt.Errorf("failed to wait for tx: %w", err)
+	}
+
+	// refresh balance
+	if err := t.accountSvc.refreshBalances(ctx); err != nil {
+		return fmt.Errorf("failed to update balances: %w", err)
+	}
+
+	return nil
 }
 
-func (t *trader) sellAuthorized(amount, minIncome sdk.Int, planID string) error {
+func (t *trader) sellAmount(ctx context.Context, amount, minIncome sdk.Int, planID string) error {
+	// only ensure gas
+	if _, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins()); err != nil {
+		return fmt.Errorf("failed to ensure balances: %w", err)
+	}
+
 	sellMsg := &types.MsgSell{
-		Seller:          t.operatorAddress,
+		Seller:          t.accountSvc.address(),
 		PlanId:          planID,
 		Amount:          amount,
 		MinIncomeAmount: minIncome,
 	}
 
-	return t.execAuthorized(sellMsg)
-}
-
-func (t *trader) execAuthorized(msg sdk.Msg) error {
-	// bech32 decode the policy address
-	_, policyAddress, err := bech32.DecodeAndConvert(t.policyAddress)
-	if err != nil {
-		return fmt.Errorf("failed to decode policy address: %w", err)
-	}
-
-	authzMsg := authz.NewMsgExec(policyAddress, []sdk.Msg{msg})
-
-	proposalMsg, err := types.NewMsgSubmitProposal(
-		t.policyAddress,
-		[]string{t.account.Address},
-		[]sdk.Msg{&authzMsg},
-		"== Fulfill Order ==",
-		types.Exec_EXEC_TRY,
-		"trade-iro-authorized",
-		"trade-iro-authorized",
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create proposal message: %w", err)
-	}
-
-	rsp, err := t.client.BroadcastTx(t.account.Name, proposalMsg)
+	tx, err := t.client.BroadcastTx(t.accountSvc.accountName, sellMsg)
 	if err != nil {
 		return fmt.Errorf("failed to broadcast tx: %w", err)
 	}
 
-	// t.logger.Info("broadcast tx", zap.String("tx-hash", rsp.TxHash))
-
-	resp, err := waitForTx(t.client, rsp.TxHash)
-	if err != nil {
+	if _, err := waitForTx(t.accountSvc.client, tx.TxHash); err != nil {
 		return fmt.Errorf("failed to wait for tx: %w", err)
 	}
 
-	var presp []proposalResp
-	if err = json.Unmarshal([]byte(resp.TxResponse.RawLog), &presp); err != nil {
-		return fmt.Errorf("failed to unmarshal tx response: %w", err)
+	// refresh balance
+	if err := t.accountSvc.refreshBalances(ctx); err != nil {
+		return fmt.Errorf("failed to update balances: %w", err)
 	}
-
-	// hack to extract error from logs
-	for _, p := range presp {
-		for _, ev := range p.Events {
-			if ev.Type == "cosmos.group.v1.EventExec" {
-				for _, attr := range ev.Attributes {
-					if attr.Key == "logs" && strings.Contains(attr.Value, "proposal execution failed") {
-						theErr := ""
-						parts := strings.Split(attr.Value, " : ")
-						if len(parts) > 1 {
-							theErr = parts[1]
-						} else {
-							theErr = attr.Value
-						}
-						return fmt.Errorf("proposal execution failed: %s", theErr)
-					}
-				}
-			}
-		}
-	}
-
-	t.logger.Info("tx executed", zap.String("tx-hash", rsp.TxHash))
 
 	return nil
 }
 
-type proposalResp struct {
-	MsgIndex int `json:"msg_index"`
-	Events   []struct {
-		Type       string `json:"type"`
-		Attributes []struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
-		} `json:"attributes"`
-	} `json:"events"`
+func (t *trader) balanceOfDYM() sdk.Int {
+	return t.accountSvc.balanceOf("adym")
 }

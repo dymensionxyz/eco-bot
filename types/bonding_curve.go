@@ -294,3 +294,7 @@ func checkPrecision(d sdk.Dec) bool {
 func (p Plan) SpotPrice() sdk.Dec {
 	return p.BondingCurve.SpotPrice(p.SoldAmt)
 }
+
+func (p Plan) TotalSoldInDYM() math.Int {
+	return p.SpotPrice().MulInt(p.SoldAmt).TruncateInt()
+}

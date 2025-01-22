@@ -14,21 +14,22 @@ import (
 )
 
 type positionManager struct {
-	q querier
-	e *eventer
+	q                   querier
+	e                   *eventer
+	planPollingInterval time.Duration
 
-	plans map[uint64]types.Plan
-	plmu  sync.Mutex
+	plans []types.Plan
+	plmu  sync.RWMutex
 
 	logger *zap.Logger
 }
 
-func newPositionManager(q querier, e *eventer, logger *zap.Logger) *positionManager {
+func newPositionManager(q querier, e *eventer, planPollingInterval time.Duration, logger *zap.Logger) *positionManager {
 	return &positionManager{
-		q:      q,
-		e:      e,
-		plans:  make(map[uint64]types.Plan),
-		logger: logger,
+		q:                   q,
+		e:                   e,
+		planPollingInterval: planPollingInterval,
+		logger:              logger,
 	}
 }
 
@@ -66,12 +67,14 @@ func (pm *positionManager) start(ctx context.Context) error {
 		return fmt.Errorf("subscribe to created IROs: %w", err)
 	}
 
+	go pm.pollPlans(ctx)
+
 	return nil
 }
 
 func (pm *positionManager) iteratePlans(f func(types.Plan) error) error {
-	pm.plmu.Lock()
-	defer pm.plmu.Unlock()
+	pm.plmu.RLock()
+	defer pm.plmu.RUnlock()
 
 	for _, p := range pm.plans {
 		if err := f(p); err != nil {
@@ -82,23 +85,29 @@ func (pm *positionManager) iteratePlans(f func(types.Plan) error) error {
 	return nil
 }
 
+func (pm *positionManager) getIROPlans(ctx context.Context) {
+	plans, err := pm.q.queryIROPlans(ctx)
+	if err != nil {
+		pm.logger.Error("query IRO plans", zap.Error(err))
+		return
+	}
+
+	pm.plmu.Lock()
+	pm.plans = plans
+	pm.plmu.Unlock()
+}
+
 func (pm *positionManager) pollPlans(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
+	pm.getIROPlans(ctx)
+
+	t := time.NewTicker(pm.planPollingInterval)
 	defer t.Stop()
 
 	for {
 		select {
 		case <-t.C:
-			plans, err := pm.q.queryIROPlans(ctx)
-			if err != nil {
-				panic(err)
-			}
-
-			pm.plmu.Lock()
-			for _, p := range plans {
-				pm.plans[p.Id] = p
-			}
-			pm.plmu.Unlock()
+			pm.getIROPlans(ctx)
+			pm.logger.Info("got IRO plans", zap.Int("count", len(pm.plans)))
 		case <-ctx.Done():
 			return
 		}

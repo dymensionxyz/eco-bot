@@ -1,0 +1,18 @@
+log_level: info
+node_address: "https://rpc-blumbus.mzonder.com:443"
+analytics_url: "https://fetchanalyticsrequest-p7gld3dazq-uc.a.run.app"
+
+whale:
+    account_name: whale
+    keyring_backend: test
+    keyring_dir: /Users/aleksandarsukovic/.dymension
+
+gas:
+    fees: "12000000000000000adym"
+    minimum_gas_balance: "1000000000000000000adym"
+
+traders:
+    keyring_backend: test
+    keyring_dir: /Users/aleksandarsukovic/.order-client
+    scale: 2
+    position_manage_interval: "10m"
