@@ -34,7 +34,7 @@ func newPositionManager(q querier, e *eventer, planPollingInterval time.Duration
 }
 
 func (pm *positionManager) start(ctx context.Context) error {
-	if err := pm.e.start(ctx); err != nil {
+	if err := pm.e.start(); err != nil {
 		return fmt.Errorf("start eventer: %w", err)
 	}
 

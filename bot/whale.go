@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/dymensionxyz/cosmosclient/cosmosclient"
@@ -133,9 +134,20 @@ func (w *whale) topUp(ctx context.Context, coins sdk.Coins, toAddr string) []str
 		balance := whaleBalances.AmountOf(coin.Denom)
 
 		diff := balance.Sub(coin.Amount)
-		if diff.IsPositive() {
-			canTopUp = canTopUp.Add(coin)
+		if !diff.IsPositive() {
+			w.logger.Warn(
+				"balance is below threshold; waiting for top-up",
+				zap.String("denom", coin.Denom),
+				zap.String("balance", balance.String()),
+				zap.String("threshold", coin.Amount.String()),
+			)
+
+			if err = w.waitForWhaleTopUp(ctx, coin); err != nil {
+				w.logger.Error("failed to wait for whale top-up", zap.Error(err))
+				return nil
+			}
 		}
+		canTopUp = canTopUp.Add(coin)
 	}
 
 	if canTopUp.Empty() {
@@ -164,4 +176,29 @@ func (w *whale) topUp(ctx context.Context, coins sdk.Coins, toAddr string) []str
 	}
 
 	return toppedUp
+}
+
+func (w *whale) waitForWhaleTopUp(ctx context.Context, threshold sdk.Coin) error {
+	t := time.NewTicker(1 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context done")
+		case <-t.C:
+			balances, err := w.accountSvc.getAccountBalances(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get account balances: %w", err)
+			}
+
+			if balances.AmountOf(threshold.Denom).GT(threshold.Amount) {
+				w.logger.Info(
+					"balance topped up",
+					zap.String("denom", threshold.Denom),
+					zap.String("balance", balances.AmountOf(threshold.Denom).String()),
+					zap.String("threshold", threshold.Amount.String()),
+				)
+				return nil
+			}
+		}
+	}
 }

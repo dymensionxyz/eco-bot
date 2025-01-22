@@ -28,6 +28,8 @@ type GasConfig struct {
 
 type TraderConfig struct {
 	Scale                  int                          `mapstructure:"scale"`
+	TimeToScale            time.Duration                `mapstructure:"time_to_scale"`
+	ScaleDelayRatio        float64                      `mapstructure:"scale_delay_ratio"`
 	KeyringBackend         cosmosaccount.KeyringBackend `mapstructure:"keyring_backend"`
 	KeyringDir             string                       `mapstructure:"keyring_dir"`
 	PositionManageInterval time.Duration                `mapstructure:"position_manage_interval"`
@@ -55,6 +57,8 @@ const (
 	TraderNamePrefix           = "trader-"
 	defaultOperatorAccountName = "operator"
 	defaultTraderScale         = 2
+	defaultTimeToScale         = defaultTraderScale * time.Minute
+	defaultScaleDelayRatio     = 5.0
 )
 
 func InitConfig() {
@@ -79,6 +83,8 @@ func InitConfig() {
 	viper.SetDefault("traders.keyring_backend", testKeyringBackend)
 	viper.SetDefault("traders.keyring_dir", defaultHomeDir)
 	viper.SetDefault("traders.scale", defaultTraderScale)
+	viper.SetDefault("traders.time_to_scale", defaultTimeToScale)
+	viper.SetDefault("traders.scale_delay_ratio", defaultScaleDelayRatio)
 	viper.SetDefault("traders.position_manage_interval", 10*time.Minute)
 
 	viper.SetConfigType("yaml")

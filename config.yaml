@@ -14,5 +14,7 @@ gas:
 traders:
     keyring_backend: test
     keyring_dir: /Users/aleksandarsukovic/.order-client
-    scale: 2
+    scale: 4
+    time_to_scale: 1m
+    scale_delay_ratio: 2.0
     position_manage_interval: "10m"

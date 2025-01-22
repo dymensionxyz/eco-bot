@@ -326,12 +326,7 @@ func waitForTx(client cosmosClient, txHash string) (*tx.GetTxResponse, error) {
 	}
 }
 
-func addTraderAccounts(scale int, clientConfig config.ClientConfig, logger *zap.Logger) ([]account, error) {
-	cClient, err := cosmosclient.New(config.GetCosmosClientOptions(clientConfig)...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cosmos client for trader: %w", err)
-	}
-
+func scaleTraderAccounts(scale int, cClient cosmosclient.Client, logger *zap.Logger) ([]account, error) {
 	accs, err := getTraderAccounts(cClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trader accounts: %w", err)
@@ -340,9 +335,11 @@ func addTraderAccounts(scale int, clientConfig config.ClientConfig, logger *zap.
 	numFoundTraders := len(accs)
 
 	tradersAccountsToCreate := max(0, scale) - numFoundTraders
-	if tradersAccountsToCreate > 0 {
-		logger.Info("creating trader accounts", zap.Int("accounts", tradersAccountsToCreate))
+	if tradersAccountsToCreate <= 0 {
+		return accs, nil
 	}
+
+	logger.Info("creating trader accounts", zap.Int("accounts", tradersAccountsToCreate))
 
 	newAccs, err := createTraderAccounts(cClient, tradersAccountsToCreate)
 	if err != nil {

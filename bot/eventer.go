@@ -30,7 +30,7 @@ func newEventer(
 	}
 }
 
-func (e *eventer) start(ctx context.Context) error {
+func (e *eventer) start() error {
 	if err := e.rpc.Start(); err != nil {
 		return fmt.Errorf("start rpc client: %w", err)
 	}
