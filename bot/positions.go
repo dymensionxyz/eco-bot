@@ -18,10 +18,15 @@ type positionManager struct {
 	e                   *eventer
 	planPollingInterval time.Duration
 
-	plans []types.Plan
+	plans []iroPlan
 	plmu  sync.RWMutex
 
 	logger *zap.Logger
+}
+
+type iroPlan struct {
+	types.Plan
+	analyticsResp
 }
 
 func newPositionManager(q querier, e *eventer, planPollingInterval time.Duration, logger *zap.Logger) *positionManager {
@@ -58,7 +63,17 @@ func (pm *positionManager) start(ctx context.Context) error {
 				return fmt.Errorf("query IRO plan: %w", err)
 			}
 
-			pm.plans[planId] = *plan
+			analytics, err := pm.q.queryAnalytics(plan.RollappId)
+			if err != nil {
+				return fmt.Errorf("query analytics: %w", err)
+			}
+
+			p := iroPlan{
+				Plan:          *plan,
+				analyticsResp: *analytics,
+			}
+
+			pm.plans[planId] = p
 		}
 		return nil
 	}
@@ -72,11 +87,13 @@ func (pm *positionManager) start(ctx context.Context) error {
 	return nil
 }
 
-func (pm *positionManager) iteratePlans(f func(types.Plan) error) error {
+func (pm *positionManager) iteratePlans(f iteratePlanCallback) error {
+	plansCopy := make([]iroPlan, len(pm.plans))
 	pm.plmu.RLock()
-	defer pm.plmu.RUnlock()
+	copy(plansCopy, pm.plans)
+	pm.plmu.RUnlock()
 
-	for _, p := range pm.plans {
+	for _, p := range plansCopy {
 		if err := f(p); err != nil {
 			return err
 		}
@@ -92,8 +109,23 @@ func (pm *positionManager) getIROPlans(ctx context.Context) {
 		return
 	}
 
+	var iroPlans []iroPlan
+
+	for _, p := range plans {
+		analytics, err := pm.q.queryAnalytics(p.RollappId)
+		if err != nil {
+			pm.logger.Error("query analytics", zap.Error(err))
+			continue
+		}
+
+		iroPlans = append(iroPlans, iroPlan{
+			Plan:          p,
+			analyticsResp: *analytics,
+		})
+	}
+
 	pm.plmu.Lock()
-	pm.plans = plans
+	pm.plans = iroPlans
 	pm.plmu.Unlock()
 }
 

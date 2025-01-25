@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -11,7 +13,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/dymensionxyz/eco-bot/config"
-	"github.com/dymensionxyz/eco-bot/types"
 )
 
 type bot struct {
@@ -82,10 +83,19 @@ func (b bot) addTrader(
 	accName string,
 	cClient cosmosclient.Client,
 	minGasBalance sdk.Coin,
+	cooldownRangeMinutes []int,
 	topUpCh chan topUpRequest,
 	q querier,
-	iteratePlans func(f func(types.Plan) error) error,
+	iteratePlans func(f iteratePlanCallback) error,
 ) (*trader, error) {
+	if len(cooldownRangeMinutes) != 2 {
+		return nil, fmt.Errorf("cooldown range must have 2 values")
+	}
+
+	if cooldownRangeMinutes[0] > cooldownRangeMinutes[1] {
+		return nil, fmt.Errorf("cooldown range is invalid")
+	}
+
 	as, err := newAccountService(
 		cClient,
 		logger,
@@ -108,6 +118,7 @@ func (b bot) addTrader(
 		setState,
 		getState,
 		posManageInterval,
+		cooldownRangeMinutes,
 		logger,
 	)
 
@@ -139,6 +150,49 @@ func (b bot) Start(ctx context.Context) {
 		return
 	}
 
+	cClient, err := cosmosclient.New(config.GetCosmosClientOptions(traderClientCfg)...)
+	if err != nil {
+		b.logger.Error("failed to create cosmos client for intermediary accounts", zap.Error(err))
+		return
+	}
+
+	accs, err := scaleIntermediaryAccounts(b.cfg.Whale.NumberOfIntermediaryAccounts, cClient, b.logger)
+	if err != nil {
+		b.logger.Error("failed to add intermediary accounts", zap.Error(err))
+		return
+	}
+
+	for ia := range b.cfg.Whale.NumberOfIntermediaryAccounts {
+		cClient, err := cosmosclient.New(config.GetCosmosClientOptions(traderClientCfg)...)
+		if err != nil {
+			b.logger.Error(
+				"failed to create cosmos client for intermediary account",
+				zap.Int("index", ia),
+				zap.Error(err))
+			continue
+		}
+
+		acc := accs[ia]
+
+		as, err := newAccountService(
+			cClient,
+			b.logger,
+			acc.Name,
+			minGasBalance,
+			nil,
+		)
+		if err != nil {
+			b.logger.Error(
+				"failed to create account service for intermediary account",
+				zap.Int("index", ia),
+				zap.Error(err))
+			continue
+		}
+
+		b.whale.addIntermediaryAccount(as)
+	}
+
+	cooldownRangeMinutes := parseCooldownRange(b.cfg.Traders.CooldownRangeMinutes)
 	errored := 0
 	traders := make(map[string]*trader)
 
@@ -154,7 +208,8 @@ func (b bot) Start(ctx context.Context) {
 	for traderIdx := range b.cfg.Traders.Scale {
 		cClient, err := cosmosclient.New(config.GetCosmosClientOptions(traderClientCfg)...)
 		if err != nil {
-			b.logger.Error("failed to create cosmos client for trader",
+			b.logger.Error(
+				"failed to create cosmos client for trader",
 				zap.Int("index", traderIdx),
 				zap.Error(err))
 			errored++
@@ -165,7 +220,8 @@ func (b bot) Start(ctx context.Context) {
 
 		accs, err := scaleTraderAccounts(scale, cClient, b.logger)
 		if err != nil {
-			b.logger.Error("failed to add trader accounts",
+			b.logger.Error(
+				"failed to add trader accounts",
 				zap.Int("index", traderIdx),
 				zap.Error(err))
 			errored++
@@ -174,8 +230,14 @@ func (b bot) Start(ctx context.Context) {
 
 		acc := accs[traderIdx]
 
+		b.logger.Debug(
+			fmt.Sprintf("Trader %d starting", traderIdx),
+			zap.String("name", acc.Name),
+			zap.String("address", acc.Address))
+
 		if _, ok := traders[acc.Name]; ok {
-			b.logger.Error("trader already exists",
+			b.logger.Error(
+				"trader already exists",
 				zap.Int("index", traderIdx),
 				zap.String("account", acc.Name))
 			errored++
@@ -189,6 +251,7 @@ func (b bot) Start(ctx context.Context) {
 			acc.Name,
 			cClient,
 			minGasBalance,
+			cooldownRangeMinutes,
 			b.topUpCh,
 			b.querier,
 			b.pm.iteratePlans,
@@ -197,6 +260,7 @@ func (b bot) Start(ctx context.Context) {
 			b.logger.Error(
 				"failed to create trader",
 				zap.String("account", acc.Name),
+				zap.String("address", acc.Address),
 				zap.Int("index", traderIdx),
 				zap.Error(err))
 			errored++
@@ -204,21 +268,43 @@ func (b bot) Start(ctx context.Context) {
 		}
 		traders[acc.Name] = t
 
-		b.logger.Info("trader added", zap.String("account", acc.Name))
+		b.logger.Info(
+			"trader added",
+			zap.String("account", acc.Name),
+			zap.String("address", acc.Address))
 
 		go t.managePositions()
+
+		if traderIdx == b.cfg.Traders.Scale-1 {
+			break
+		}
 
 		delaySeconds := a * math.Pow(r, float64(traderIdx-1))
 		delay := time.Duration(delaySeconds) * time.Second
 
-		fmt.Printf("Trader %d will start in %v seconds\n", traderIdx+1, delaySeconds)
+		b.logger.Debug(
+			fmt.Sprintf("Trader %d will start in %v seconds", traderIdx+1, delaySeconds),
+			zap.String("account", accs[traderIdx+1].Name),
+			zap.String("address", accs[traderIdx+1].Address))
 
 		// sleep before starting the i-th trader
 		time.Sleep(delay)
 		cumulative += delay
 	}
 
-	fmt.Printf("Total time used ~ %v\n", cumulative)
+	b.logger.Debug(fmt.Sprintf("Total time used to scale up traders ~ %v", cumulative))
 
 	<-ctx.Done()
+}
+
+func parseCooldownRange(cooldownRange string) []int {
+	var cooldownRangeMinutes []int
+	for _, v := range strings.Split(cooldownRange, "-") {
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			return []int{0, 0}
+		}
+		cooldownRangeMinutes = append(cooldownRangeMinutes, i)
+	}
+	return cooldownRangeMinutes
 }

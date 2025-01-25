@@ -21,7 +21,7 @@ func (p Plan) TargetRaise() sdk.Int {
 
 func (p Plan) MinIncome(amt sdk.Int) sdk.Int {
 	minIncome := p.GetBondingCurve().Cost(p.GetSoldAmt().Sub(amt), p.GetSoldAmt())
-	trimAmt := minIncome.Quo(sdk.NewInt(20)) // remove 5% for taker fee and whatnot
+	trimAmt := minIncome.Quo(sdk.NewInt(10)) // remove 10% for taker fee and whatnot
 	return minIncome.Sub(trimAmt)
 }
 
@@ -31,7 +31,7 @@ func (p Plan) MinAmount(spend sdk.Int) (sdk.Int, error) {
 	if err != nil {
 		return sdk.Int{}, fmt.Errorf("failed to get tokens for exact DYM: %w", err)
 	}
-	trimAmt := minAmount.Quo(sdk.NewInt(20)) // remove 5% for taker fee and whatnot
+	trimAmt := minAmount.Quo(sdk.NewInt(10)) // remove 10% for taker fee and whatnot
 	return minAmount.Sub(trimAmt), nil
 }
 

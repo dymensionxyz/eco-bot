@@ -1,11 +1,12 @@
 log_level: info
 node_address: "https://rpc-blumbus.mzonder.com:443"
-analytics_url: "https://fetchanalyticsrequest-p7gld3dazq-uc.a.run.app"
+analytics_url: "https://fetchnetworkdataitemrequest-p7gld3dazq-uc.a.run.app"
 
 whale:
     account_name: whale
     keyring_backend: test
     keyring_dir: /Users/aleksandarsukovic/.dymension
+    num_intermediary_accounts: 2
 
 gas:
     fees: "12000000000000000adym"
@@ -18,3 +19,4 @@ traders:
     time_to_scale: 1m
     scale_delay_ratio: 2.0
     position_manage_interval: "10m"
+    cooldown_range_minutes: "6-9"

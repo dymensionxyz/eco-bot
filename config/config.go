@@ -33,13 +33,15 @@ type TraderConfig struct {
 	KeyringBackend         cosmosaccount.KeyringBackend `mapstructure:"keyring_backend"`
 	KeyringDir             string                       `mapstructure:"keyring_dir"`
 	PositionManageInterval time.Duration                `mapstructure:"position_manage_interval"`
+	CooldownRangeMinutes   string                       `mapstructure:"cooldown_range_minutes"`
 }
 
 type WhaleConfig struct {
-	AccountName              string                       `mapstructure:"account_name"`
-	KeyringBackend           cosmosaccount.KeyringBackend `mapstructure:"keyring_backend"`
-	KeyringDir               string                       `mapstructure:"keyring_dir"`
-	AllowedBalanceThresholds map[string]string            `mapstructure:"allowed_balance_thresholds"`
+	AccountName                  string                       `mapstructure:"account_name"`
+	KeyringBackend               cosmosaccount.KeyringBackend `mapstructure:"keyring_backend"`
+	KeyringDir                   string                       `mapstructure:"keyring_dir"`
+	AllowedBalanceThresholds     map[string]string            `mapstructure:"allowed_balance_thresholds"`
+	NumberOfIntermediaryAccounts int                          `mapstructure:"num_intermediary_accounts"`
 }
 
 const (
@@ -54,11 +56,14 @@ const (
 	defaultMinimumGasBalance = "1000000000000000000" + defaultHubDenom
 	testKeyringBackend       = "test"
 
-	TraderNamePrefix           = "trader-"
-	defaultOperatorAccountName = "operator"
-	defaultTraderScale         = 2
-	defaultTimeToScale         = defaultTraderScale * time.Minute
-	defaultScaleDelayRatio     = 5.0
+	TraderNamePrefix            = "trader-"
+	IntermediaryPrefix          = "inter-"
+	defaultOperatorAccountName  = "operator"
+	defaultTraderScale          = 2
+	defaultTimeToScale          = defaultTraderScale * time.Minute
+	defaultScaleDelayRatio      = 5.0
+	defaultIntermediaryAccounts = 1
+	defaultCooldownRangeMinutes = "3-5"
 )
 
 func InitConfig() {
@@ -76,9 +81,10 @@ func InitConfig() {
 	viper.SetDefault("gas.fees", defaultGasFees)
 	viper.SetDefault("gas.minimum_gas_balance", defaultMinimumGasBalance)
 
-	viper.SetDefault("operator.account_name", defaultOperatorAccountName)
-	viper.SetDefault("operator.keyring_backend", testKeyringBackend)
-	viper.SetDefault("operator.keyring_dir", defaultHomeDir)
+	viper.SetDefault("whale.account_name", defaultOperatorAccountName)
+	viper.SetDefault("whale.keyring_backend", testKeyringBackend)
+	viper.SetDefault("whale.keyring_dir", defaultHomeDir)
+	viper.SetDefault("whale.num_intermediary_accounts", defaultIntermediaryAccounts)
 
 	viper.SetDefault("traders.keyring_backend", testKeyringBackend)
 	viper.SetDefault("traders.keyring_dir", defaultHomeDir)
@@ -86,6 +92,7 @@ func InitConfig() {
 	viper.SetDefault("traders.time_to_scale", defaultTimeToScale)
 	viper.SetDefault("traders.scale_delay_ratio", defaultScaleDelayRatio)
 	viper.SetDefault("traders.position_manage_interval", 10*time.Minute)
+	viper.SetDefault("traders.cooldown_range_minutes", defaultCooldownRangeMinutes)
 
 	viper.SetConfigType("yaml")
 	if CfgFile != "" {

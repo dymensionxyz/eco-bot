@@ -63,7 +63,7 @@ func newAccountService(
 	a := &accountService{
 		client:            client,
 		accountRegistry:   client.AccountRegistry,
-		logger:            logger.With(zap.String("module", "account-service")),
+		logger:            logger.With(zap.String("module", "account-service"), zap.String("account", accountName)),
 		accountName:       accountName,
 		homeDir:           client.Context().HomeDir,
 		bankClient:        banktypes.NewQueryClient(client.Context()),
@@ -260,6 +260,22 @@ func getTraderAccounts(client cosmosclient.Client) (accs []account, err error) {
 	return
 }
 
+func getIntermediaryAccounts(client cosmosclient.Client) (accs []account, err error) {
+	var accounts []account
+	accounts, err = listAccounts(client)
+	if err != nil {
+		return
+	}
+
+	for _, acc := range accounts {
+		if !strings.HasPrefix(acc.Name, config.IntermediaryPrefix) {
+			continue
+		}
+		accs = append(accs, acc)
+	}
+	return
+}
+
 func listAccounts(client cosmosclient.Client) ([]account, error) {
 	accs, err := client.AccountRegistry.List()
 	if err != nil {
@@ -291,6 +307,22 @@ func createTraderAccounts(client cosmosclient.Client, count int) (accs []account
 		}
 		acc := account{
 			Name:    traderName,
+			Address: addr,
+		}
+		accs = append(accs, acc)
+	}
+	return
+}
+
+func createIntermediaryAccounts(client cosmosclient.Client, count int) (accs []account, err error) {
+	for range count {
+		intermediaryName := fmt.Sprintf("%s%s", config.IntermediaryPrefix, uuid.New().String()[0:5])
+		addr, err := addAccount(client, intermediaryName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create account: %w", err)
+		}
+		acc := account{
+			Name:    intermediaryName,
 			Address: addr,
 		}
 		accs = append(accs, acc)
@@ -350,6 +382,34 @@ func scaleTraderAccounts(scale int, cClient cosmosclient.Client, logger *zap.Log
 
 	if len(accs) < scale {
 		return nil, fmt.Errorf("expected %d trader accounts, got %d", scale, len(accs))
+	}
+	return accs, nil
+}
+
+func scaleIntermediaryAccounts(scale int, cClient cosmosclient.Client, logger *zap.Logger) ([]account, error) {
+	accs, err := getIntermediaryAccounts(cClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get intermediary accounts: %w", err)
+	}
+
+	numFoundIntermediaries := len(accs)
+
+	intermediaryAccountsToCreate := max(0, scale) - numFoundIntermediaries
+	if intermediaryAccountsToCreate <= 0 {
+		return accs, nil
+	}
+
+	logger.Info("creating intermediary accounts", zap.Int("accounts", intermediaryAccountsToCreate))
+
+	newAccs, err := createIntermediaryAccounts(cClient, intermediaryAccountsToCreate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create intermediary accounts: %w", err)
+	}
+
+	accs = slices.Concat(accs, newAccs)
+
+	if len(accs) < scale {
+		return nil, fmt.Errorf("expected %d intermediary accounts, got %d", scale, len(accs))
 	}
 	return accs, nil
 }

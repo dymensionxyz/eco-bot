@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand"
 	"slices"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ type trader struct {
 	client                 cosmosClient
 	NAV                    sdk.Int // net asset value of all positions in DYM
 	q                      querier
-	iteratePlans           func(func(types.Plan) error) error
+	iteratePlans           func(iteratePlanCallback) error
 	positions              map[uint64]position
 	getState               func() (*state, error)
 	setState               func(*state) error
@@ -31,8 +32,11 @@ type trader struct {
 	getBalances            func(context.Context) (sdk.Coins, error)
 	balanceDYM             func() sdk.Int
 	positionManageInterval time.Duration
+	cooldownRangeMinutes   []int
 	logger                 *zap.Logger
 }
+
+type iteratePlanCallback func(plan iroPlan) error
 
 type position struct {
 	valueDYM  sdk.Int
@@ -60,16 +64,15 @@ var (
 	standardTargetRaise = sdk.NewDec(10000)
 )
 
-const coolDownPeriod = 12 * time.Hour
-
 func newTrader(
 	accountSvc *accountService,
 	q querier,
-	iteratePlans func(func(types.Plan) error) error,
+	iteratePlans func(iteratePlanCallback) error,
 	cClient cosmosClient,
 	getState func() (*state, error),
 	setState func(*state) error,
 	positionManageInterval time.Duration,
+	cooldownRangeMinutes []int,
 	logger *zap.Logger,
 ) *trader {
 	t := &trader{
@@ -81,6 +84,7 @@ func newTrader(
 		getState:               getState,
 		setState:               setState,
 		positionManageInterval: positionManageInterval,
+		cooldownRangeMinutes:   cooldownRangeMinutes,
 		logger:                 logger.With(zap.String("trader", accountSvc.accountName)),
 		NAV:                    sdk.NewInt(0),
 	}
@@ -118,7 +122,7 @@ func (t *trader) updatePlans() error {
 	// position is a plan with a balance
 	t.NAV = sdk.NewInt(0)
 
-	if err := t.iteratePlans(func(plan types.Plan) error {
+	if err := t.iteratePlans(func(plan iroPlan) error {
 		b := t.accountSvc.balanceOf(IRODenom(plan.RollappId))
 		if b.IsPositive() {
 			price := plan.SpotPrice()
@@ -180,27 +184,18 @@ func (t *trader) positionsRun(ctx context.Context) error {
 		return fmt.Errorf("failed to load positions: %w", err)
 	}
 
-	err := t.iteratePlans(func(plan types.Plan) error {
-		analytics, err := t.q.queryAnalytics(plan.RollappId)
-		if err != nil {
-			return fmt.Errorf("failed to query analytics: %w", err)
-		}
-
+	return t.iteratePlans(func(plan iroPlan) error {
 		// if position exists for the trader
 		if pos, ok := t.positions[plan.Id]; ok {
 			return t.manageExistingPosition(
 				ctx, &plan, pos,
-				analytics.Volume.oneDayChangeInPercent(),
-				analytics.TotalSupply.oneDayPriceChangeInPercent(),
+				plan.analyticsResp.Volume.oneDayChangeInPercent(),
+				plan.analyticsResp.TotalSupply.oneDayPriceChangeInPercent(),
 			)
 		}
 
 		return t.tryOpenNewPosition(&plan, ctx)
 	})
-	if err != nil {
-		return fmt.Errorf("failed to iterate plans: %w", err)
-	}
-	return nil
 }
 
 /*
@@ -301,6 +296,10 @@ func (t *trader) ensureAccountIsPrimed(ctx context.Context, totalPortfolioValue 
 	return nil
 }
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
 /*
 TODO:
   - introduce configurable parameters for percentages
@@ -316,16 +315,18 @@ func (t *trader) manageExistingPosition(
 	balanceDym := sdk.NewDecFromInt(t.balanceDYM())
 	nav := sdk.NewDecFromInt(t.NAV)
 	percentage := valueInDYM.Quo(nav.Add(balanceDym))
-	valParts := strings.Split(valueInDYM.String(), ".")
-	valInDYMStr := fmt.Sprintf("%s.%s", valParts[0], valParts[1][:2])
+	valInDYMStr := formatAmount(strings.Split(valueInDYM.String(), ".")[0])
 	percParts := strings.Split(percentage.Mul(sdk.NewDec(100)).String(), ".")
-	percentageStr := fmt.Sprintf("%s.%s", percParts[0], percParts[1][:2])
+	percentageStr := fmt.Sprintf("%s.%s", percParts[0], percParts[1][:4])
 
 	t.logger.Debug("managing existing position",
 		zap.Uint64("plan_id", planID),
 		zap.String("value_in_dym", valInDYMStr),
 		zap.String("percentage", fmt.Sprintf("%s", percentageStr)),
-		zap.String("NAV", t.NAV.String()))
+		zap.String("NAV", formatAmount(t.NAV.String())),
+		zap.Float64("one_day_volume_change_in_percent", oneDayVolumeChangeInPercent),
+		zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent),
+	)
 
 	st, err := t.getState()
 	if err != nil {
@@ -334,11 +335,17 @@ func (t *trader) manageExistingPosition(
 
 	s := st.Positions[fmt.Sprint(planID)]
 	now := time.Now().Unix()
+
+	coolDownPeriod := getRandomCooldown(6, 9) // random
 	nextVolumeCheck := s.LastVolumeCheck + int64(coolDownPeriod.Seconds())
 	nextPriceCheck := s.LastPriceCheck + int64(coolDownPeriod.Seconds())
+	canTradeVol := nextVolumeCheck <= now
+	canTradePrice := nextPriceCheck <= now
+
 	sellAmt := sdk.NewInt(0)
 
 	// sell
+
 	switch {
 	// If a token's value increases beyond 10% of total portfolio value- > sell gradually excess to return to 10%.
 	case percentage.GT(sdk.MustNewDecFromStr("0.1")):
@@ -361,7 +368,7 @@ func (t *trader) manageExistingPosition(
 		sellAmt = balances.AmountOf(IRODenom(plan.GetRollappId()))
 		delete(t.positions, planID)
 	// If volume decreases >50%, decrease position by 10% of current size.
-	case nextVolumeCheck <= now && oneDayVolumeChangeInPercent <= -50:
+	case canTradeVol && oneDayVolumeChangeInPercent <= -50:
 		t.logger.Info("volume decreased >50%, decreasing position by 10%",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_change_in_percent", oneDayVolumeChangeInPercent))
@@ -370,7 +377,7 @@ func (t *trader) manageExistingPosition(
 	// Implement a trailing stop-loss of 50% for each token position.
 
 	// if token dropped in 25% price → sell 50%.
-	case nextPriceCheck <= now && oneDayPriceChangeInPercent <= -25:
+	case canTradePrice && oneDayPriceChangeInPercent <= -25:
 		t.logger.Info("token dropped in 25% price, selling 50% of position",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
@@ -378,7 +385,7 @@ func (t *trader) manageExistingPosition(
 		sellAmt = pos.amount.Mul(sdk.NewInt(50)).Quo(sdk.NewInt(100))
 		s.LastPriceCheck = now
 	// If price decreases >10%, decrease position by 10% of current size.
-	case nextPriceCheck <= now && oneDayPriceChangeInPercent <= -10:
+	case canTradePrice && oneDayPriceChangeInPercent <= -10:
 		t.logger.Info("price decreases >10%, decreasing position by 10%",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
@@ -386,7 +393,7 @@ func (t *trader) manageExistingPosition(
 		sellAmt = pos.amount.Quo(sdk.NewInt(10))
 		s.LastPriceCheck = now
 	// Take profits on individual tokens that have gained > 200% by selling 25% the position.
-	case nextPriceCheck <= now && oneDayPriceChangeInPercent > 200:
+	case canTradePrice && oneDayPriceChangeInPercent > 200:
 		t.logger.Info("token have gained > 200%, selling 25% of position",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
@@ -418,7 +425,7 @@ func (t *trader) manageExistingPosition(
 
 	switch {
 	// If volume increases >50% on a daily normalized timeframe, increase position by 10% of current size.
-	case nextVolumeCheck <= now && oneDayVolumeChangeInPercent > 50:
+	case canTradeVol && oneDayVolumeChangeInPercent > 50:
 		t.logger.Info("volume increased >50%, increasing position by 10%",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_change_in_percent", oneDayVolumeChangeInPercent))
@@ -426,13 +433,13 @@ func (t *trader) manageExistingPosition(
 		buyAmt = sdk.NewDecFromInt(pos.amount.Quo(sdk.NewInt(10)))
 		s.LastVolumeCheck = now
 	// If price increases >10% on a daily normalized timeframe, increase position by 10% of current size.
-	case nextPriceCheck <= now && oneDayPriceChangeInPercent > 10:
+	case canTradePrice && oneDayPriceChangeInPercent > 10:
 		t.logger.Info("price increased >10%, increasing position by 10%",
 			zap.Uint64("plan_id", planID),
 			zap.Float64("one_day_price_change_in_percent", oneDayPriceChangeInPercent))
 		// get the amount to buy (every time 10%)
 		buyAmt = sdk.NewDecFromInt(pos.amount.Quo(sdk.NewInt(10)))
-		s.LastVolumeCheck = now
+		s.LastPriceCheck = now
 	}
 
 	if !buyAmt.IsPositive() {
@@ -523,6 +530,22 @@ func (t *trader) sellAmount(ctx context.Context, amount, minIncome sdk.Int, plan
 	return nil
 }
 
+func getRandomCooldown(min, max int) time.Duration {
+	delta := max - min
+	if delta < 0 {
+		delta = 0
+	}
+	r := rand.Intn(delta+1) + min
+	return time.Duration(r) * time.Minute
+}
+
 func (t *trader) balanceOfDYM() sdk.Int {
 	return t.accountSvc.balanceOf("adym")
+}
+
+func formatAmount(numStr string) string {
+	if len(numStr) <= 18 {
+		return "0." + string(strings.Repeat("0", 18-len(numStr)) + numStr)[:4]
+	}
+	return numStr[:len(numStr)-18] + "." + numStr[len(numStr)-18:len(numStr)-14]
 }

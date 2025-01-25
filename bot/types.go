@@ -62,28 +62,28 @@ func IRODenom(rollappID string) string {
 }
 
 type analyticsResp struct {
-	Volume         volume         `json:"volume"`
-	CreationDate   int64          `json:"creationDate"`
-	Currencies     []currency     `json:"currencies"`
-	Bech32Prefix   string         `json:"bech32Prefix"`
-	Launched       bool           `json:"launched"`
-	Type           string         `json:"type"`
-	CoinType       int            `json:"coinType"`
-	PreLaunchTime  int64          `json:"preLaunchTime"`
-	InitialSupply  float64        `json:"initialSupply"`
-	Status         string         `json:"status"`
-	TotalSupply    totalSupply    `json:"totalSupply"`
-	TotalSponsored totalSponsored `json:"totalSponsored"`
+	Volume volume `json:"volume"`
+	// CreationDate   int64          `json:"creationDate"`
+	// Currencies     []currency     `json:"currencies"`
+	// Bech32Prefix   string         `json:"bech32Prefix"`
+	// Launched       bool           `json:"launched"`
+	// Type           string         `json:"type"`
+	// CoinType       int            `json:"coinType"`
+	// PreLaunchTime  int64          `json:"preLaunchTime"`
+	// InitialSupply  float64        `json:"initialSupply"`
+	// Status         string         `json:"status"`
+	TotalSupply totalSupply `json:"totalSupply"`
+	// TotalSponsored totalSponsored `json:"totalSponsored"`
 }
 
 type volume struct {
-	DiffWeek              float64 `json:"diffWeek"`
-	PreviousWeekValue     float64 `json:"previousWeekValue"`
-	PreviousTwoDaysValue  float64 `json:"previousTwoDaysValue"`
-	PreviousTwoWeeksValue float64 `json:"previousTwoWeeksValue"`
-	PreviousDayValue      float64 `json:"previousDayValue"`
-	Value                 float64 `json:"value"`
-	DiffDay               float64 `json:"diffDay"`
+	// DiffWeek              float64 `json:"diffWeek"`
+	// PreviousWeekValue     float64 `json:"previousWeekValue"`
+	// PreviousTwoDaysValue  float64 `json:"previousTwoDaysValue"`
+	// PreviousTwoWeeksValue float64 `json:"previousTwoWeeksValue"`
+	PreviousDayValue float64 `json:"previousDayValue"`
+	Value            float64 `json:"value"`
+	// DiffDay               float64 `json:"diffDay"`
 }
 
 func (v volume) oneDayChangeInPercent() float64 {
@@ -101,13 +101,13 @@ type currency struct {
 }
 
 type totalSupply struct {
-	PreviousTwoWeeksValue value   `json:"previousTwoWeeksValue"`
-	DiffDay               float64 `json:"diffDay"`
-	DiffWeek              float64 `json:"diffWeek"`
-	Value                 value   `json:"value"`
-	PreviousTwoDaysValue  value   `json:"previousTwoDaysValue"`
-	PreviousDayValue      value   `json:"previousDayValue"`
-	PreviousWeekValue     value   `json:"previousWeekValue"`
+	// PreviousTwoWeeksValue value   `json:"previousTwoWeeksValue"`
+	// DiffDay               float64 `json:"diffDay"`
+	// DiffWeek              float64 `json:"diffWeek"`
+	Value value `json:"value"`
+	// PreviousTwoDaysValue  value   `json:"previousTwoDaysValue"`
+	PreviousDayValue value `json:"previousDayValue"`
+	// PreviousWeekValue     value   `json:"previousWeekValue"`
 }
 
 func (t totalSupply) price() float64 {
