@@ -116,7 +116,7 @@ func TestTryOpenNewposition(t *testing.T) {
 			}
 
 			ctx := context.Background()
-			err := mt.tryOpenNewPosition(mp, ctx)
+			err := mt.tryOpenNewPosition(ctx, mp)
 
 			if tc.wantErr {
 				require.Error(t, err, "expected an error but got none")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"math/rand"
 	"slices"
 	"strings"
@@ -61,7 +62,7 @@ type plan interface {
 }
 
 var (
-	// DYM                 = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	DYM                 = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
 	standardTargetRaise = sdk.NewDec(10000)
 )
 
@@ -523,7 +524,7 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 
 func (t *trader) openRandomPosition(ctx context.Context, plan iroPlan) error {
 	// get a random amount to buy from 5 to 50 DYM
-	amount := sdk.NewInt(int64(rand.Intn(50)+5) * 1000000000000000000) // from 5 to 50 DYM
+	amount := sdk.NewInt(int64(rand.Intn(50) + 5)).Mul(DYM) // from 5 to 50 DYM
 	minAmount, err := plan.MinAmount(amount)
 	if err != nil {
 		return fmt.Errorf("failed to get min amount: %w", err)
@@ -549,7 +550,7 @@ func (t *trader) manageRandomPosition(
 	// buy or sell random amount
 	if rand.Intn(2) == 0 {
 		// buy
-		amount := sdk.NewInt(int64(rand.Intn(50)+5) * 1000000000000000000) // from 5 to 50 DYM
+		amount := sdk.NewInt(int64(rand.Intn(50) + 5)).Mul(DYM) // from 5 to 50 DYM
 		minAmount, err := plan.MinAmount(amount)
 		if err != nil {
 			return fmt.Errorf("failed to get min amount: %w", err)
