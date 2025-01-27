@@ -103,30 +103,14 @@ func (pm *positionManager) iteratePlans(f iteratePlanCallback) error {
 }
 
 func (pm *positionManager) getIROPlans(ctx context.Context) {
-	plans, err := pm.q.queryIROPlans(ctx)
+	pm.plmu.Lock()
+	defer pm.plmu.Unlock()
+	var err error
+	pm.plans, err = pm.q.queryIROPlans(ctx)
 	if err != nil {
 		pm.logger.Error("query IRO plans", zap.Error(err))
 		return
 	}
-
-	var iroPlans []iroPlan
-
-	for _, p := range plans {
-		analytics, err := pm.q.queryAnalytics(p.RollappId)
-		if err != nil {
-			pm.logger.Error("query analytics", zap.Error(err))
-			continue
-		}
-
-		iroPlans = append(iroPlans, iroPlan{
-			Plan:          p,
-			analyticsResp: *analytics,
-		})
-	}
-
-	pm.plmu.Lock()
-	pm.plans = iroPlans
-	pm.plmu.Unlock()
 }
 
 func (pm *positionManager) pollPlans(ctx context.Context) {
@@ -139,7 +123,7 @@ func (pm *positionManager) pollPlans(ctx context.Context) {
 		select {
 		case <-t.C:
 			pm.getIROPlans(ctx)
-			pm.logger.Info("got IRO plans", zap.Int("count", len(pm.plans)))
+			pm.logger.Debug("got IRO plans", zap.Int("count", len(pm.plans)))
 		case <-ctx.Done():
 			return
 		}

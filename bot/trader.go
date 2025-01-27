@@ -33,6 +33,7 @@ type trader struct {
 	balanceDYM             func() sdk.Int
 	positionManageInterval time.Duration
 	cooldownRangeMinutes   []int
+	maxPositions           int
 	logger                 *zap.Logger
 }
 
@@ -73,6 +74,7 @@ func newTrader(
 	setState func(*state) error,
 	positionManageInterval time.Duration,
 	cooldownRangeMinutes []int,
+	maxPositions int,
 	logger *zap.Logger,
 ) *trader {
 	t := &trader{
@@ -87,12 +89,71 @@ func newTrader(
 		cooldownRangeMinutes:   cooldownRangeMinutes,
 		logger:                 logger.With(zap.String("trader", accountSvc.accountName)),
 		NAV:                    sdk.NewInt(0),
+		maxPositions:           maxPositions,
 	}
 	t.buy = t.buyAmount
 	t.sell = t.sellAmount
 	t.getBalances = t.accountSvc.getAccountBalances
 	t.balanceDYM = t.balanceOfDYM
 	return t
+}
+
+// managePositions periodically traverses all the positions and applies logic to manage them by trading.
+// logic is applied to decide what to do with current positions, and if any new positions should be opened.
+func (t *trader) managePositions() {
+	s, err := t.getState()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			s = &state{
+				// Positions: make(map[string]positionState), TODO: enable
+			}
+			if err := t.setState(s); err != nil {
+				t.logger.Error("failed to set state", zap.Error(err))
+				return
+			}
+		} else {
+			t.logger.Error("failed to get state", zap.Error(err))
+			return
+		}
+	}
+
+	ctx := context.Background()
+
+	if err := t.buyAndSellRandomly(ctx); err != nil {
+		t.logger.Error("failed to run positions", zap.Error(err))
+	}
+
+	ticker := time.NewTicker(t.positionManageInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := t.buyAndSellRandomly(ctx); err != nil {
+				t.logger.Error("failed to run positions", zap.Error(err))
+			}
+		}
+	}
+}
+
+// unused for now
+func (t *trader) positionsRun(ctx context.Context) error {
+	if err := t.loadPositions(ctx); err != nil {
+		return fmt.Errorf("failed to load positions: %w", err)
+	}
+
+	return t.iteratePlans(func(plan iroPlan) error {
+		// if position exists for the trader
+		if pos, ok := t.positions[plan.Id]; ok {
+			return t.manageExistingPosition(
+				ctx, &plan, pos,
+				plan.analyticsResp.Volume.oneDayChangeInPercent(),
+				plan.analyticsResp.TotalSupply.oneDayPriceChangeInPercent(),
+			)
+		}
+
+		return t.tryOpenNewPosition(ctx, &plan)
+	})
 }
 
 // loadPositions gets all the balances for the trader account and loads all the plans,
@@ -102,7 +163,7 @@ func (t *trader) loadPositions(ctx context.Context) error {
 		return fmt.Errorf("failed to update balances: %w", err)
 	}
 
-	if err := t.updatePlans(); err != nil {
+	if err := t.updatePositions(); err != nil {
 		return fmt.Errorf("failed to update plans: %w", err)
 	}
 
@@ -118,8 +179,8 @@ func (t *trader) loadPositions(ctx context.Context) error {
 	return nil
 }
 
-func (t *trader) updatePlans() error {
-	// position is a plan with a balance
+func (t *trader) updatePositions() error {
+	// a position is a plan with a balance
 	t.NAV = sdk.NewInt(0)
 
 	if err := t.iteratePlans(func(plan iroPlan) error {
@@ -141,70 +202,13 @@ func (t *trader) updatePlans() error {
 	return nil
 }
 
-// managePositions periodically traverses all the positions and applies logic to manage them by trading.
-// logic is applied to decide what to do with current positions, and if any new positions should be opened.
-func (t *trader) managePositions() {
-	s, err := t.getState()
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			s = &state{
-				Positions: make(map[string]positionState),
-			}
-			if err := t.setState(s); err != nil {
-				t.logger.Error("failed to set state", zap.Error(err))
-				return
-			}
-		} else {
-			t.logger.Error("failed to get state", zap.Error(err))
-			return
-		}
-	}
-
-	ctx := context.Background()
-
-	if err := t.positionsRun(ctx); err != nil {
-		t.logger.Error("failed to run positions", zap.Error(err))
-	}
-
-	ticker := time.NewTicker(t.positionManageInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := t.positionsRun(ctx); err != nil {
-				t.logger.Error("failed to run positions", zap.Error(err))
-			}
-		}
-	}
-}
-
-func (t *trader) positionsRun(ctx context.Context) error {
-	if err := t.loadPositions(ctx); err != nil {
-		return fmt.Errorf("failed to load positions: %w", err)
-	}
-
-	return t.iteratePlans(func(plan iroPlan) error {
-		// if position exists for the trader
-		if pos, ok := t.positions[plan.Id]; ok {
-			return t.manageExistingPosition(
-				ctx, &plan, pos,
-				plan.analyticsResp.Volume.oneDayChangeInPercent(),
-				plan.analyticsResp.TotalSupply.oneDayPriceChangeInPercent(),
-			)
-		}
-
-		return t.tryOpenNewPosition(&plan, ctx)
-	})
-}
-
 /*
 TODO:
   - how to get totalPortfolioValue ?
   - introduce configurable parameters for percentages for allocation
   - will previously closed positions be opened again???
 */
-func (t *trader) tryOpenNewPosition(plan plan, ctx context.Context) error {
+func (t *trader) tryOpenNewPosition(ctx context.Context, plan plan) error {
 	// ===== decide how much to allocate based on the target raise of the IRO =====
 	targetRaise := sdk.NewDecFromInt(plan.TargetRaise())
 	toAllocateTRPercent := sdk.NewDec(0)
@@ -336,7 +340,7 @@ func (t *trader) manageExistingPosition(
 	s := st.Positions[fmt.Sprint(planID)]
 	now := time.Now().Unix()
 
-	coolDownPeriod := getRandomCooldown(6, 9) // random
+	coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1]) // random
 	nextVolumeCheck := s.LastVolumeCheck + int64(coolDownPeriod.Seconds())
 	nextPriceCheck := s.LastPriceCheck + int64(coolDownPeriod.Seconds())
 	canTradeVol := nextVolumeCheck <= now
@@ -465,6 +469,123 @@ func (t *trader) manageExistingPosition(
 	return nil
 }
 
+func (t *trader) buyAndSellRandomly(ctx context.Context) error {
+	if err := t.loadPositions(ctx); err != nil {
+		return fmt.Errorf("failed to load positions: %w", err)
+	}
+
+	return t.iteratePlans(func(plan iroPlan) error {
+		st, err := t.getState()
+		if err != nil {
+			return err
+		}
+
+		now := time.Now().Unix()
+
+		coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1]) // random
+		if st.LastTrade+int64(coolDownPeriod.Seconds()) > now {
+			return nil
+		}
+
+		st.LastTrade = now
+
+		canOpen := len(t.positions) < t.maxPositions
+		openOrManage := rand.Intn(2) == 0 || !canOpen
+
+		// if position exists for the trader
+		if _, ok := t.positions[plan.Id]; ok && openOrManage {
+			if err := t.manageRandomPosition(ctx, plan); err != nil {
+				return fmt.Errorf("failed to manage random position: %w", err)
+			}
+
+			if err := t.setState(st); err != nil {
+				return fmt.Errorf("failed to set state: %w", err)
+			}
+
+			return nil
+		}
+
+		if !canOpen {
+			return nil
+		}
+
+		if err := t.openRandomPosition(ctx, plan); err != nil {
+			return fmt.Errorf("failed to open random position: %w", err)
+		}
+
+		if err := t.setState(st); err != nil {
+			t.logger.Error("failed to set state", zap.Error(err))
+		}
+
+		return nil
+	})
+}
+
+func (t *trader) openRandomPosition(ctx context.Context, plan iroPlan) error {
+	// get a random amount to buy from 1 to 5 DYM
+	amount := sdk.NewInt(int64(rand.Intn(2)+1) * 1000000000000000000)
+	minAmount, err := plan.MinAmount(amount)
+	if err != nil {
+		return fmt.Errorf("failed to get min amount: %w", err)
+	}
+
+	if err := t.buy(ctx, amount, minAmount, fmt.Sprint(plan.GetId())); err != nil {
+		return fmt.Errorf("failed to buy: %w", err)
+	}
+
+	t.positions[plan.GetId()] = position{
+		valueDYM:  amount,
+		amount:    minAmount,
+		createdAt: time.Now(),
+	}
+
+	return nil
+}
+
+func (t *trader) manageRandomPosition(
+	ctx context.Context,
+	plan iroPlan,
+) error {
+	// buy or sell random amount
+	if rand.Intn(2) == 0 {
+		// buy
+		amount := sdk.NewInt(int64(rand.Intn(2)+1) * 1000000000000000000) // from 5 to 50 DYM
+		minAmount, err := plan.MinAmount(amount)
+		if err != nil {
+			return fmt.Errorf("failed to get min amount: %w", err)
+		}
+
+		if err := t.buy(ctx, amount, minAmount, fmt.Sprint(plan.GetId())); err != nil {
+			return fmt.Errorf("failed to buy: %w", err)
+		}
+	} else {
+		// sell
+		balances, err := t.getBalances(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get account balances: %w", err)
+		}
+
+		totalAmount := balances.AmountOf(IRODenom(plan.GetRollappId()))
+		sellAmtPercent := rand.Intn(96) + 5 // from 5 to 100%
+		sellAmt := totalAmount.Mul(sdk.NewInt(int64(sellAmtPercent))).Quo(sdk.NewInt(100))
+
+		if totalAmount.IsZero() {
+			delete(t.positions, plan.Id)
+			return nil
+		}
+
+		if err := t.sell(ctx, sellAmt, plan.MinIncome(sellAmt), fmt.Sprint(plan.GetId())); err != nil {
+			return fmt.Errorf("failed to sell: %w", err)
+		}
+
+		if sellAmtPercent == 100 {
+			delete(t.positions, plan.Id)
+		}
+	}
+
+	return nil
+}
+
 func (t *trader) buyAmount(ctx context.Context, spend, minAmount sdk.Int, planID string) error {
 	toppedUp, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins(sdk.NewCoin("adym", spend)))
 	if err != nil {
@@ -491,6 +612,8 @@ func (t *trader) buyAmount(ctx context.Context, spend, minAmount sdk.Int, planID
 	if _, err := waitForTx(t.accountSvc.client, tx.TxHash); err != nil {
 		return fmt.Errorf("failed to wait for tx: %w", err)
 	}
+
+	t.logger.Info("bought", zap.String("spend", spend.String()), zap.String("min_amount", minAmount.String()))
 
 	// refresh balance
 	if err := t.accountSvc.refreshBalances(ctx); err != nil {
@@ -521,6 +644,8 @@ func (t *trader) sellAmount(ctx context.Context, amount, minIncome sdk.Int, plan
 	if _, err := waitForTx(t.accountSvc.client, tx.TxHash); err != nil {
 		return fmt.Errorf("failed to wait for tx: %w", err)
 	}
+
+	t.logger.Info("sold", zap.String("amount", amount.String()), zap.String("min_income", minIncome.String()))
 
 	// refresh balance
 	if err := t.accountSvc.refreshBalances(ctx); err != nil {

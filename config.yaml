@@ -1,12 +1,12 @@
-log_level: info
-node_address: "https://rpc-blumbus.mzonder.com:443"
-analytics_url: "https://fetchnetworkdataitemrequest-p7gld3dazq-uc.a.run.app"
+log_level: debug
+node_address: "https://dymension-mainnet-tendermint.blastapi.io:443/291f79ab-77c1-4c90-b769-8218b1816f5c"
+analytics_url: "https://fetchnetworkdataitemrequest-xqbg2swtrq-uc.a.run.app"
 
 whale:
     account_name: whale
     keyring_backend: test
     keyring_dir: /Users/aleksandarsukovic/.dymension
-    num_intermediary_accounts: 2
+    num_intermediary_accounts: 20
 
 gas:
     fees: "12000000000000000adym"
@@ -14,9 +14,9 @@ gas:
 
 traders:
     keyring_backend: test
-    keyring_dir: /Users/aleksandarsukovic/.order-client
-    scale: 4
-    time_to_scale: 1m
+    keyring_dir: /Users/aleksandarsukovic/.order-client1
+    scale: 100
+    time_to_scale: 96h
     scale_delay_ratio: 2.0
-    position_manage_interval: "10m"
-    cooldown_range_minutes: "6-9"
+    position_manage_interval: "5m"
+    cooldown_range_minutes: "60-720"

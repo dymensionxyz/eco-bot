@@ -10,6 +10,7 @@ import (
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"go.uber.org/zap"
 
 	"github.com/dymensionxyz/eco-bot/types"
 )
@@ -19,14 +20,16 @@ type querier struct {
 	httpClient   http.Client
 	chainID      string
 	analyticsURL string
+	logger       *zap.Logger
 }
 
-func newQuerier(client cosmosClient, analyticsURL string) querier {
+func newQuerier(client cosmosClient, analyticsURL string, logger *zap.Logger) querier {
 	return querier{
 		client:       client,
 		httpClient:   http.Client{},
 		chainID:      client.Context().ChainID,
 		analyticsURL: analyticsURL,
+		logger:       logger,
 	}
 }
 
@@ -42,7 +45,7 @@ func (q querier) queryIROPlan(ctx context.Context, id string) (*types.Plan, erro
 }
 
 // TODO: use analytics or indexer API instead of RPC
-func (q querier) queryIROPlans(ctx context.Context) ([]types.Plan, error) {
+func (q querier) queryIROPlans(ctx context.Context) ([]iroPlan, error) {
 	c := types.NewQueryClient(q.client.Context())
 	resp, err := c.QueryPlans(ctx, &types.QueryPlansRequest{
 		NonSettledOnly: true,
@@ -54,7 +57,7 @@ func (q querier) queryIROPlans(ctx context.Context) ([]types.Plan, error) {
 
 	now := time.Now()
 
-	var plans []types.Plan
+	var plans []iroPlan
 	for _, p := range resp.Plans {
 		if p.SettledDenom != "" {
 			continue
@@ -62,15 +65,26 @@ func (q querier) queryIROPlans(ctx context.Context) ([]types.Plan, error) {
 		if p.StartTime.After(now) {
 			continue
 		}
-		plans = append(plans, p)
+		analytics, err := q.queryAnalytics(p.RollappId)
+		if err != nil {
+			q.logger.Error("query analytics", zap.Error(err))
+			continue
+		}
+
+		plans = append(plans, iroPlan{
+			Plan:          p,
+			analyticsResp: *analytics,
+		})
 	}
 
-	slices.SortFunc(plans, func(p1, p2 types.Plan) int {
-		if p1.Id > p2.Id {
-			return 1
-		}
-		if p1.Id < p2.Id {
+	// sort by Total DYM sold
+	slices.SortFunc(plans, func(p1, p2 iroPlan) int {
+		soldInDYM1, soldInDYM2 := p1.TotalSoldInDYM(), p2.TotalSoldInDYM()
+		if soldInDYM1.GT(soldInDYM2) {
 			return -1
+		}
+		if soldInDYM1.LT(soldInDYM2) {
+			return 1
 		}
 		return 0
 	})

@@ -2,8 +2,12 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +52,7 @@ func NewBot(cfg config.Config, logger *zap.Logger) (*bot, error) {
 	}
 
 	subscriberId := fmt.Sprintf("subscriber-%s", cfg.Whale.AccountName)
-	q := newQuerier(pmClient, cfg.AnalyticsURL)
+	q := newQuerier(pmClient, cfg.AnalyticsURL, logger)
 	e := newEventer(pmClient.RPC, pmClient.WSEvents, subscriberId, logger)
 	pm := newPositionManager(q, e, cfg.Traders.PositionManageInterval, logger)
 	topUpCh := make(chan topUpRequest, cfg.Traders.Scale)
@@ -84,6 +88,7 @@ func (b bot) addTrader(
 	cClient cosmosclient.Client,
 	minGasBalance sdk.Coin,
 	cooldownRangeMinutes []int,
+	maxPositions int,
 	topUpCh chan topUpRequest,
 	q querier,
 	iteratePlans func(f iteratePlanCallback) error,
@@ -119,10 +124,48 @@ func (b bot) addTrader(
 		getState,
 		posManageInterval,
 		cooldownRangeMinutes,
+		maxPositions,
 		logger,
 	)
 
 	return t, nil
+}
+
+type botState struct {
+	LastScaledTraderIdx int `json:"last_scaled_trader_idx"`
+}
+
+func (b *botState) saveState(dir string) error {
+	jsn, err := json.Marshal(b)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %w", err)
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("%s/state.json", dir), jsn, 0644); err != nil {
+		return fmt.Errorf("failed to write state to file: %w", err)
+	}
+
+	return nil
+}
+
+func (b *botState) loadState(dir string) error {
+	jsn, err := os.ReadFile(fmt.Sprintf("%s/state.json", dir))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if err := b.saveState(dir); err != nil {
+				return fmt.Errorf("failed to save state: %w", err)
+			}
+			return nil
+		} else {
+			return fmt.Errorf("failed to read state from file: %w", err)
+		}
+	}
+
+	if err := json.Unmarshal(jsn, b); err != nil {
+		return fmt.Errorf("failed to unmarshal state: %w", err)
+	}
+
+	return nil
 }
 
 func (b bot) Start(ctx context.Context) {
@@ -192,6 +235,14 @@ func (b bot) Start(ctx context.Context) {
 		b.whale.addIntermediaryAccount(as)
 	}
 
+	// save state to file
+	st := &botState{}
+	if err := st.loadState(b.cfg.Traders.KeyringDir); err != nil {
+		b.logger.Error("failed to load state", zap.Error(err))
+		return
+	}
+
+	lastScaledIdx := st.LastScaledTraderIdx
 	cooldownRangeMinutes := parseCooldownRange(b.cfg.Traders.CooldownRangeMinutes)
 	errored := 0
 	traders := make(map[string]*trader)
@@ -244,6 +295,8 @@ func (b bot) Start(ctx context.Context) {
 			continue
 		}
 
+		maxPositions := 10 - traderIdx%5
+
 		t, err := b.addTrader(
 			b.cfg.Traders.KeyringDir,
 			b.cfg.Traders.PositionManageInterval,
@@ -252,6 +305,7 @@ func (b bot) Start(ctx context.Context) {
 			cClient,
 			minGasBalance,
 			cooldownRangeMinutes,
+			maxPositions,
 			b.topUpCh,
 			b.querier,
 			b.pm.iteratePlans,
@@ -275,17 +329,22 @@ func (b bot) Start(ctx context.Context) {
 
 		go t.managePositions()
 
+		st.LastScaledTraderIdx = traderIdx
+		if err := st.saveState(b.cfg.Traders.KeyringDir); err != nil {
+			b.logger.Error("failed to save state", zap.Error(err))
+		}
+
 		if traderIdx == b.cfg.Traders.Scale-1 {
 			break
 		}
 
 		delaySeconds := a * math.Pow(r, float64(traderIdx-1))
+		if traderIdx < lastScaledIdx {
+			delaySeconds = 0
+		}
 		delay := time.Duration(delaySeconds) * time.Second
 
-		b.logger.Debug(
-			fmt.Sprintf("Trader %d will start in %v seconds", traderIdx+1, delaySeconds),
-			zap.String("account", accs[traderIdx+1].Name),
-			zap.String("address", accs[traderIdx+1].Address))
+		b.logger.Debug(fmt.Sprintf("Trader %d will start in %v seconds", traderIdx+1, delaySeconds))
 
 		// sleep before starting the i-th trader
 		time.Sleep(delay)
