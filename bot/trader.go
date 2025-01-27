@@ -522,8 +522,8 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 }
 
 func (t *trader) openRandomPosition(ctx context.Context, plan iroPlan) error {
-	// get a random amount to buy from 1 to 5 DYM
-	amount := sdk.NewInt(int64(rand.Intn(2)+1) * 1000000000000000000)
+	// get a random amount to buy from 5 to 50 DYM
+	amount := sdk.NewInt(int64(rand.Intn(50)+5) * 1000000000000000000) // from 5 to 50 DYM
 	minAmount, err := plan.MinAmount(amount)
 	if err != nil {
 		return fmt.Errorf("failed to get min amount: %w", err)
@@ -549,7 +549,7 @@ func (t *trader) manageRandomPosition(
 	// buy or sell random amount
 	if rand.Intn(2) == 0 {
 		// buy
-		amount := sdk.NewInt(int64(rand.Intn(2)+1) * 1000000000000000000) // from 5 to 50 DYM
+		amount := sdk.NewInt(int64(rand.Intn(50)+5) * 1000000000000000000) // from 5 to 50 DYM
 		minAmount, err := plan.MinAmount(amount)
 		if err != nil {
 			return fmt.Errorf("failed to get min amount: %w", err)
