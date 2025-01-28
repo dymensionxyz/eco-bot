@@ -92,6 +92,7 @@ func (b bot) addTrader(
 	topUpCh chan topUpRequest,
 	q querier,
 	iteratePlans func(f iteratePlanCallback) error,
+	getRanomPlan func(topX int) *iroPlan,
 ) (*trader, error) {
 	if len(cooldownRangeMinutes) != 2 {
 		return nil, fmt.Errorf("cooldown range must have 2 values")
@@ -119,6 +120,7 @@ func (b bot) addTrader(
 		as,
 		q,
 		iteratePlans,
+		getRanomPlan,
 		cClient,
 		setState,
 		getState,
@@ -309,6 +311,7 @@ func (b bot) Start(ctx context.Context) {
 			b.topUpCh,
 			b.querier,
 			b.pm.iteratePlans,
+			b.pm.getRandomTopXPlan,
 		)
 		if err != nil {
 			b.logger.Error(

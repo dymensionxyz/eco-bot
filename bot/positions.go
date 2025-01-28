@@ -96,9 +96,30 @@ func (pm *positionManager) iteratePlans(f iteratePlanCallback) error {
 	pm.plmu.RUnlock()
 
 	for _, p := range plansCopy {
-		if err := f(p); err != nil {
+		stop, err := f(p)
+		if err != nil {
 			return err
 		}
+		if stop {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (pm *positionManager) getRandomTopXPlan(x int) *iroPlan {
+	topPlans := make(map[string]iroPlan, x)
+	_ = pm.iteratePlans(func(p iroPlan) (bool, error) {
+		topPlans[p.RollappId] = p
+		if len(topPlans) >= x {
+			return true, nil
+		}
+		return false, nil
+	})
+
+	for _, v := range topPlans {
+		return &v
 	}
 
 	return nil

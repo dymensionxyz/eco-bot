@@ -25,6 +25,7 @@ type trader struct {
 	NAV                    sdk.Int // net asset value of all positions in DYM
 	q                      querier
 	iteratePlans           func(iteratePlanCallback) error
+	getRanomPlan           func(topX int) *iroPlan
 	positions              map[uint64]position
 	getState               func() (*state, error)
 	setState               func(*state) error
@@ -38,7 +39,7 @@ type trader struct {
 	logger                 *zap.Logger
 }
 
-type iteratePlanCallback func(plan iroPlan) error
+type iteratePlanCallback func(plan iroPlan) (bool, error)
 
 type position struct {
 	valueDYM  sdk.Int
@@ -70,6 +71,7 @@ func newTrader(
 	accountSvc *accountService,
 	q querier,
 	iteratePlans func(iteratePlanCallback) error,
+	getRanomPlan func(int) *iroPlan,
 	cClient cosmosClient,
 	getState func() (*state, error),
 	setState func(*state) error,
@@ -83,6 +85,7 @@ func newTrader(
 		client:                 cClient,
 		q:                      q,
 		iteratePlans:           iteratePlans,
+		getRanomPlan:           getRanomPlan,
 		positions:              make(map[uint64]position),
 		getState:               getState,
 		setState:               setState,
@@ -145,17 +148,17 @@ func (t *trader) positionsRun(ctx context.Context) error {
 		return fmt.Errorf("failed to load positions: %w", err)
 	}
 
-	return t.iteratePlans(func(plan iroPlan) error {
+	return t.iteratePlans(func(plan iroPlan) (bool, error) {
 		// if position exists for the trader
 		if pos, ok := t.positions[plan.Id]; ok {
-			return t.manageExistingPosition(
+			return false, t.manageExistingPosition(
 				ctx, &plan, pos,
 				plan.analyticsResp.Volume.oneDayChangeInPercent(),
 				plan.analyticsResp.TotalSupply.oneDayPriceChangeInPercent(),
 			)
 		}
 
-		return t.tryOpenNewPosition(ctx, &plan)
+		return false, t.tryOpenNewPosition(ctx, &plan)
 	})
 }
 
@@ -177,7 +180,7 @@ func (t *trader) updatePositions() error {
 	// a position is a plan with a balance
 	t.NAV = sdk.NewInt(0)
 
-	if err := t.iteratePlans(func(plan iroPlan) error {
+	if err := t.iteratePlans(func(plan iroPlan) (bool, error) {
 		b := t.accountSvc.balanceOf(IRODenom(plan.RollappId))
 		if b.IsPositive() {
 			price := plan.SpotPrice()
@@ -188,7 +191,7 @@ func (t *trader) updatePositions() error {
 			}
 			t.NAV = t.NAV.Add(valueDYM)
 		}
-		return nil
+		return false, nil
 	}); err != nil {
 		return fmt.Errorf("failed to iterate plans: %w", err)
 	}
@@ -490,40 +493,38 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 	coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1])
 	st.NextTrade = now + int64(coolDownPeriod.Seconds())
 
-	return t.iteratePlans(func(plan iroPlan) error {
-		canOpen := len(t.positions) < t.maxPositions
-		openOrManage := rand.Intn(2) == 0 || !canOpen
+	canOpen := len(t.positions) < t.maxPositions
+	pl := t.getRanomPlan(t.maxPositions)
 
-		// if position exists for the trader
-		if _, ok := t.positions[plan.Id]; ok && openOrManage {
-			if err := t.manageRandomPosition(ctx, plan); err != nil {
-				return fmt.Errorf("failed to manage random position: %w", err)
-			}
-
-			if err := t.setState(st); err != nil {
-				return fmt.Errorf("failed to set state: %w", err)
-			}
-
-			return nil
-		}
-
-		if !canOpen {
-			return nil
-		}
-
-		if err := t.openRandomPosition(ctx, plan); err != nil {
-			return fmt.Errorf("failed to open random position: %w", err)
+	// if position exists for the trader
+	if _, ok := t.positions[pl.Id]; ok {
+		if err := t.manageRandomPosition(ctx, pl); err != nil {
+			return fmt.Errorf("failed to manage random position: %w", err)
 		}
 
 		if err := t.setState(st); err != nil {
-			t.logger.Error("failed to set state", zap.Error(err))
+			return fmt.Errorf("failed to set state: %w", err)
 		}
 
 		return nil
-	})
+	}
+
+	if !canOpen {
+		return nil
+	}
+
+	if err := t.openRandomPosition(ctx, pl); err != nil {
+		return fmt.Errorf("failed to open random position: %w", err)
+	}
+
+	if err := t.setState(st); err != nil {
+		t.logger.Error("failed to set state", zap.Error(err))
+	}
+
+	return nil
 }
 
-func (t *trader) openRandomPosition(ctx context.Context, plan iroPlan) error {
+func (t *trader) openRandomPosition(ctx context.Context, plan *iroPlan) error {
 	// get a random amount to buy from 5 to 50 DYM
 	amount := sdk.NewInt(int64(rand.Intn(50) + 5)).Mul(DYM) // from 5 to 50 DYM
 	minAmount, err := plan.MinAmount(amount)
@@ -546,7 +547,7 @@ func (t *trader) openRandomPosition(ctx context.Context, plan iroPlan) error {
 
 func (t *trader) manageRandomPosition(
 	ctx context.Context,
-	plan iroPlan,
+	plan *iroPlan,
 ) error {
 	// buy or sell random amount
 	if rand.Intn(2) == 0 {
