@@ -79,15 +79,22 @@ func (q querier) queryIROPlans(ctx context.Context) ([]iroPlan, error) {
 
 	// sort by Total DYM sold
 	slices.SortFunc(plans, func(p1, p2 iroPlan) int {
-		soldInDYM1, soldInDYM2 := p1.TotalSoldInDYM(), p2.TotalSoldInDYM()
-		if soldInDYM1.GT(soldInDYM2) {
+		tr1, tr2 := p1.TargetRaise(), p2.TargetRaise()
+		if tr1.GT(tr2) {
 			return -1
 		}
-		if soldInDYM1.LT(soldInDYM2) {
+		if tr1.LT(tr2) {
 			return 1
 		}
 		return 0
 	})
+	/*
+		for i, p := range plans {
+			fmt.Printf("No. %d, Rollapp ID: %s, Target Raise: %s\n", i+1, p.Plan.RollappId, p.Plan.TargetRaise().String())
+			if i >= 9 {
+				break
+			}
+		}*/
 
 	return plans, nil
 }

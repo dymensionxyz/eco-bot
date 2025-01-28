@@ -82,6 +82,8 @@ func (pm *positionManager) start(ctx context.Context) error {
 		return fmt.Errorf("subscribe to created IROs: %w", err)
 	}
 
+	pm.getIROPlans(ctx)
+
 	go pm.pollPlans(ctx)
 
 	return nil
@@ -114,8 +116,6 @@ func (pm *positionManager) getIROPlans(ctx context.Context) {
 }
 
 func (pm *positionManager) pollPlans(ctx context.Context) {
-	pm.getIROPlans(ctx)
-
 	t := time.NewTicker(pm.planPollingInterval)
 	defer t.Stop()
 

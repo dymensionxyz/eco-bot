@@ -27,6 +27,7 @@ type account struct {
 type state struct {
 	Positions map[string]positionState `json:"positions"`
 	LastTrade int64                    `json:"lastTrade"`
+	NextTrade int64                    `json:"nextTrade"`
 }
 
 type positionState struct {

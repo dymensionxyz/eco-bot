@@ -54,7 +54,7 @@ type cosmosClient interface {
 type plan interface {
 	GetId() uint64
 	GetRollappId() string
-	TargetRaise() sdk.Int
+	TargetRaise() sdk.Dec
 	TotalSoldInDYM() sdk.Int
 	SpotPrice() sdk.Dec
 	MinIncome(sdk.Int) sdk.Int
@@ -88,9 +88,11 @@ func newTrader(
 		setState:               setState,
 		positionManageInterval: positionManageInterval,
 		cooldownRangeMinutes:   cooldownRangeMinutes,
-		logger:                 logger.With(zap.String("trader", accountSvc.accountName)),
-		NAV:                    sdk.NewInt(0),
-		maxPositions:           maxPositions,
+		logger: logger.With(
+			zap.String("trader", accountSvc.accountName),
+			zap.String("address", accountSvc.address())),
+		NAV:          sdk.NewInt(0),
+		maxPositions: maxPositions,
 	}
 	t.buy = t.buyAmount
 	t.sell = t.sellAmount
@@ -168,15 +170,6 @@ func (t *trader) loadPositions(ctx context.Context) error {
 		return fmt.Errorf("failed to update plans: %w", err)
 	}
 
-	positionPlanIDs := make([]uint64, 0, len(t.positions))
-	for planID := range t.positions {
-		positionPlanIDs = append(positionPlanIDs, planID)
-	}
-
-	slices.Sort(positionPlanIDs)
-
-	t.logger.Info("open positions", zap.Uint64s("plan_ids", positionPlanIDs))
-
 	return nil
 }
 
@@ -211,7 +204,7 @@ TODO:
 */
 func (t *trader) tryOpenNewPosition(ctx context.Context, plan plan) error {
 	// ===== decide how much to allocate based on the target raise of the IRO =====
-	targetRaise := sdk.NewDecFromInt(plan.TargetRaise())
+	targetRaise := plan.TargetRaise()
 	toAllocateTRPercent := sdk.NewDec(0)
 
 	// If standard 0.05%
@@ -299,10 +292,6 @@ func (t *trader) ensureAccountIsPrimed(ctx context.Context, totalPortfolioValue 
 		}
 	}
 	return nil
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 /*
@@ -475,21 +464,33 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 		return fmt.Errorf("failed to load positions: %w", err)
 	}
 
+	st, err := t.getState()
+	if err != nil {
+		return err
+	}
+
+	positionPlanIDs := make([]uint64, 0, len(t.positions))
+	for planID := range t.positions {
+		positionPlanIDs = append(positionPlanIDs, planID)
+	}
+
+	slices.Sort(positionPlanIDs)
+
+	t.logger.Info("open positions",
+		zap.Time("next_trade", time.Unix(st.NextTrade, 0)),
+		zap.Uint64s("plan_ids", positionPlanIDs))
+
+	now := time.Now().Unix()
+
+	if st.NextTrade > now {
+		return nil
+	}
+
+	st.LastTrade = now
+	coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1])
+	st.NextTrade = now + int64(coolDownPeriod.Seconds())
+
 	return t.iteratePlans(func(plan iroPlan) error {
-		st, err := t.getState()
-		if err != nil {
-			return err
-		}
-
-		now := time.Now().Unix()
-
-		coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1]) // random
-		if st.LastTrade+int64(coolDownPeriod.Seconds()) > now {
-			return nil
-		}
-
-		st.LastTrade = now
-
 		canOpen := len(t.positions) < t.maxPositions
 		openOrManage := rand.Intn(2) == 0 || !canOpen
 

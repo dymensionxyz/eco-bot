@@ -295,7 +295,7 @@ func (b bot) Start(ctx context.Context) {
 			continue
 		}
 
-		maxPositions := 10 - traderIdx%5
+		maxPositions := 10 - traderIdx%9
 
 		t, err := b.addTrader(
 			b.cfg.Traders.KeyringDir,

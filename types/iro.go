@@ -4,19 +4,42 @@ import (
 	"fmt"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/shopspring/decimal"
 )
 
-func (p Plan) TargetRaise() sdk.Int {
-	allocation := p.TotalAllocation.Amount.Quo(sdk.NewDec(10).Power(18).TruncateInt())
+/*
+
+export const fetchPlanTargetRaise = (plan: Plan, part = 100): number => {
+    if (!plan.bondingCurve || !plan.totalAllocation) {
+        return 0;
+    }
+    const curve = convertToBondingCurve(plan.bondingCurve);
+    const allocation = Decimal.fromAtomics(plan.totalAllocation.amount, 18).toFloatApproximation() * part / 100;
+    return curve.M === 0 ? curve.C * allocation : curve.M * (allocation ** (curve.N + 1)) / (curve.N + 1);
+};
+
+*/
+
+func (p Plan) TargetRaise() sdk.Dec {
+	ta := sdk.NewDecFromInt(p.TotalAllocation.Amount)
+	if ta.IsZero() {
+		ta = sdk.NewDec(1)
+	}
+	iroProgress := sdk.NewDecFromInt(p.SoldAmt).Mul(sdk.NewDec(100)).Quo(ta)
+	allocation := sdk.NewDecFromInt(p.TotalAllocation.Amount).Quo(sdk.NewDec(10).Power(18)).Mul(iroProgress).Quo(sdk.NewDec(100))
 	targetRaise := sdk.NewDec(0)
 	if p.BondingCurve.M.IsZero() {
-		targetRaise = p.BondingCurve.C.Mul(sdk.NewDecFromInt(allocation))
+		targetRaise = p.BondingCurve.C.Mul(allocation)
 	} else {
-		targetRaise = p.BondingCurve.M.
-			Mul(sdk.NewDecFromInt(allocation).Power(uint64(p.BondingCurve.N.Add(sdk.NewDec(1)).TruncateInt64()))).
-			Quo(p.BondingCurve.N.Add(sdk.NewDec(1)))
+		nPlusOne := p.BondingCurve.N.Add(sdk.NewDec(1))
+		dDec := decimal.NewFromBigInt(allocation.BigInt(), -sdk.Precision)
+		power, err := dDec.PowWithPrecision(decimal.RequireFromString(nPlusOne.String()), -sdk.Precision)
+		if err != nil {
+			panic(err)
+		}
+		targetRaise = p.BondingCurve.M.Mul(sdk.MustNewDecFromStr(power.StringFixed(-4))).Quo(nPlusOne)
 	}
-	return targetRaise.TruncateInt()
+	return targetRaise
 }
 
 func (p Plan) MinIncome(amt sdk.Int) sdk.Int {
