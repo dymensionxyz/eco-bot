@@ -12,7 +12,9 @@ import (
 
 type Config struct {
 	NodeAddress  string       `mapstructure:"node_address"`
+	NodeREST     string       `mapstructure:"node_rest"`
 	AnalyticsURL string       `mapstructure:"analytics_url"`
+	RollappsURL  string       `mapstructure:"rollapps_url"`
 	DBPath       string       `mapstructure:"db_path"`
 	Gas          GasConfig    `mapstructure:"gas"`
 	Whale        WhaleConfig  `mapstructure:"whale"`
@@ -50,6 +52,7 @@ const (
 
 	defaultNodeAddress       = "http://localhost:36657"
 	defaultAnalyticsURL      = "https://fetchanalyticsrequest-p7gld3dazq-uc.a.run.app"
+	defaultRollappsURL       = "https://fetchnetworkdatarequest-xqbg2swtrq-uc.a.run.app"
 	defaultLogLevel          = "info"
 	defaultHubDenom          = "adym"
 	defaultGasFees           = "3000000000000000" + defaultHubDenom
@@ -78,6 +81,7 @@ func InitConfig() {
 	viper.SetDefault("log_level", defaultLogLevel)
 	viper.SetDefault("node_address", defaultNodeAddress)
 	viper.SetDefault("analytics_url", defaultAnalyticsURL)
+	viper.SetDefault("rollapps_url", defaultRollappsURL)
 	viper.SetDefault("gas.fees", defaultGasFees)
 	viper.SetDefault("gas.minimum_gas_balance", defaultMinimumGasBalance)
 

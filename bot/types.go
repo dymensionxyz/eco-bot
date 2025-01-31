@@ -1,22 +1,28 @@
 package bot
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
-
-	"github.com/dymensionxyz/eco-bot/types"
+	channeltypes "github.com/cosmos/ibc-go/v6/modules/core/04-channel/types"
+	tmbytes "github.com/tendermint/tendermint/libs/bytes"
 )
 
-func tokensForDYM(plan *types.Plan, amt sdk.Int) (sdk.Coin, error) {
-	tokensAmt, err := plan.BondingCurve.TokensForExactDYM(plan.SoldAmt, amt)
-	if err != nil {
-		return sdk.Coin{}, err
-	}
+type (
+	iteratePlanCallback    func(plan iroPlan) (bool, error)
+	iterateRollappCallback func(rollapp) (bool, error)
+)
 
-	return sdk.NewCoin(IRODenom(plan.RollappId), tokensAmt), nil
+type position struct {
+	valueDYM  sdk.Int
+	amount    sdk.Int
+	createdAt time.Time
+	isIRO     bool
 }
 
 type account struct {
@@ -100,6 +106,7 @@ type currency struct {
 	BaseDenom    string `json:"baseDenom"`
 	Decimals     int    `json:"decimals"`
 	Type         string `json:"type"`
+	IBCDenom     string `json:"rollappIbcRepresentation"`
 }
 
 type totalSupply struct {
@@ -157,4 +164,109 @@ type totalSponsored struct {
 type prevValue struct {
 	Weight float64 `json:"weight"`
 	Power  float64 `json:"power"`
+}
+
+type rollappsResp []rollapp
+
+type rollapp struct {
+	ChainID    string     `json:"chainId"`
+	Status     string     `json:"status"`
+	Liquidity  sdk.Int    `json:"liquidity"`
+	IBC        ibc        `json:"ibc"`
+	Currencies []currency `json:"currencies"`
+	IBCDenom   string
+	PoolID     uint64
+}
+
+type gammPoolsResp struct {
+	Pools []gammPool `json:"pools"`
+}
+type gammPool struct {
+	Type       string `json:"@type"`
+	Address    string `json:"address"`
+	Id         string `json:"id"`
+	PoolParams struct {
+		SwapFee                  string      `json:"swap_fee"`
+		ExitFee                  string      `json:"exit_fee"`
+		SmoothWeightChangeParams interface{} `json:"smooth_weight_change_params"`
+	} `json:"pool_params"`
+	FuturePoolGovernor string `json:"future_pool_governor"`
+	TotalShares        struct {
+		Denom  string `json:"denom"`
+		Amount string `json:"amount"`
+	} `json:"total_shares"`
+	PoolAssets []struct {
+		Token struct {
+			Denom  string `json:"denom"`
+			Amount string `json:"amount"`
+		} `json:"token"`
+		Weight string `json:"weight"`
+	} `json:"pool_assets"`
+	TotalWeight string `json:"total_weight"`
+}
+
+type ibc struct {
+	Timeout    int    `json:"timeout"`
+	HubChannel string `json:"hubChannel"`
+	Channel    string `json:"channel"`
+}
+
+type DenomTrace struct {
+	// path defines the chain of port/channel identifiers used for tracing the
+	// source of the fungible token.
+	Path string `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	// base denomination of the relayed fungible token.
+	BaseDenom string `protobuf:"bytes,2,opt,name=base_denom,json=baseDenom,proto3" json:"base_denom,omitempty"`
+}
+
+func ParseDenomTrace(rawDenom string) DenomTrace {
+	denomSplit := strings.Split(rawDenom, "/")
+
+	if denomSplit[0] == rawDenom {
+		return DenomTrace{
+			Path:      "",
+			BaseDenom: rawDenom,
+		}
+	}
+
+	path, baseDenom := extractPathAndBaseFromFullDenom(denomSplit)
+	return DenomTrace{
+		Path:      path,
+		BaseDenom: baseDenom,
+	}
+}
+
+func (dt DenomTrace) Hash() tmbytes.HexBytes {
+	hash := sha256.Sum256([]byte(dt.GetFullDenomPath()))
+	return hash[:]
+}
+
+func extractPathAndBaseFromFullDenom(fullDenomItems []string) (string, string) {
+	var (
+		path      []string
+		baseDenom []string
+	)
+
+	length := len(fullDenomItems)
+	for i := 0; i < length; i += 2 {
+		if i < length-1 && length > 2 && channeltypes.IsValidChannelID(fullDenomItems[i+1]) {
+			path = append(path, fullDenomItems[i], fullDenomItems[i+1])
+		} else {
+			baseDenom = fullDenomItems[i:]
+			break
+		}
+	}
+
+	return strings.Join(path, "/"), strings.Join(baseDenom, "/")
+}
+
+func (dt DenomTrace) GetFullDenomPath() string {
+	if dt.Path == "" {
+		return dt.BaseDenom
+	}
+	return dt.GetPrefix() + dt.BaseDenom
+}
+
+func (dt DenomTrace) GetPrefix() string {
+	return dt.Path + "/"
 }

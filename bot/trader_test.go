@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -92,7 +93,7 @@ func TestTryOpenNewposition(t *testing.T) {
 			mt := &mockTrader{
 				trader: trader{
 					NAV:       tc.nav,
-					positions: make(map[uint64]position),
+					positions: make(map[string]position),
 					logger:    zap.NewNop(),
 				},
 				buyErr:      tc.buyErr,
@@ -110,7 +111,7 @@ func TestTryOpenNewposition(t *testing.T) {
 
 			mp := mockPlan{
 				id:           42,
-				targetRaise:  tc.targetRaise.TruncateInt(),
+				targetRaise:  tc.targetRaise,
 				totalSoldDYM: tc.totalSold,
 				spotPrice:    tc.spotPrice,
 			}
@@ -134,7 +135,7 @@ func TestTryOpenNewposition(t *testing.T) {
 
 			assert.Equal(t, wantAmt.String(), mt.buySpend.String(), "the buy amt doesn't match expected allocation")
 
-			pos, ok := mt.trader.positions[42]
+			pos, ok := mt.trader.positions[fmt.Sprint(42)]
 			require.True(t, ok, "expected position with planID 42 to be set in trader")
 			assert.Equal(t, wantAmt.Int64(), pos.valueDYM.Int64())
 			spotPrice := tc.spotPrice
@@ -378,8 +379,8 @@ func TestManageExistingposition(t *testing.T) {
 			mt := &mockTrader{
 				trader: trader{
 					NAV: tc.nav,
-					positions: map[uint64]position{
-						tc.plan.id: tc.pos,
+					positions: map[string]position{
+						fmt.Sprint(tc.plan.id): tc.pos,
 					},
 					logger: zap.NewNop(),
 				},
@@ -431,7 +432,7 @@ func TestManageExistingposition(t *testing.T) {
 			}
 
 			if tc.expectDeletePos {
-				_, found := mt.trader.positions[tc.plan.id]
+				_, found := mt.trader.positions[fmt.Sprint(tc.plan.id)]
 				require.False(t, found, "expected position to be deleted, but still found")
 			}
 		})
@@ -489,7 +490,7 @@ func (mt *mockTrader) getState() (*state, error) {
 
 type mockPlan struct {
 	id           uint64
-	targetRaise  sdk.Int
+	targetRaise  sdk.Dec
 	totalSoldDYM sdk.Int
 	spotPrice    sdk.Dec
 	minAmtErr    error
@@ -497,7 +498,7 @@ type mockPlan struct {
 
 func (m mockPlan) GetId() uint64                        { return m.id }
 func (m mockPlan) GetRollappId() string                 { return "mock_123-1" }
-func (m mockPlan) TargetRaise() sdk.Int                 { return m.targetRaise }
+func (m mockPlan) TargetRaise() sdk.Dec                 { return m.targetRaise }
 func (m mockPlan) TotalSoldInDYM() sdk.Int              { return m.totalSoldDYM }
 func (m mockPlan) SpotPrice() sdk.Dec                   { return m.spotPrice }
 func (m mockPlan) MinIncome(s sdk.Int) sdk.Int          { return s }

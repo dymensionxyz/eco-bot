@@ -20,15 +20,19 @@ type querier struct {
 	httpClient   http.Client
 	chainID      string
 	analyticsURL string
+	rollappsURL  string
+	nodeRESTURL  string
 	logger       *zap.Logger
 }
 
-func newQuerier(client cosmosClient, analyticsURL string, logger *zap.Logger) querier {
+func newQuerier(client cosmosClient, analyticsURL, rollappsURL, nodeRESTURL string, logger *zap.Logger) querier {
 	return querier{
 		client:       client,
 		httpClient:   http.Client{},
 		chainID:      client.Context().ChainID,
 		analyticsURL: analyticsURL,
+		rollappsURL:  rollappsURL,
+		nodeRESTURL:  nodeRESTURL,
 		logger:       logger,
 	}
 }
@@ -97,6 +101,41 @@ func (q querier) queryIROPlans(ctx context.Context) ([]iroPlan, error) {
 		}*/
 
 	return plans, nil
+}
+
+func (q querier) queryRollapps() (rollappsResp, error) {
+	url := fmt.Sprintf("%s?networkId=%s&dataType=rollapps", q.rollappsURL, q.chainID)
+	resp, err := get[rollappsResp](q.httpClient, url)
+	if err != nil {
+		return nil, fmt.Errorf("query analytics: %w", err)
+	}
+
+	rollapps := make(rollappsResp, 0, len(resp))
+	for _, r := range resp {
+		if r.Status == "Active" {
+			for _, c := range r.Currencies {
+				if c.IBCDenom != "" {
+					r.IBCDenom = c.IBCDenom
+				} else {
+					trace := fmt.Sprintf("transfer/%s/%s", r.IBC.HubChannel, c.BaseDenom)
+					r.IBCDenom = fmt.Sprintf("ibc/%x", ParseDenomTrace(trace).Hash())
+				}
+				break
+			}
+			rollapps = append(rollapps, r)
+		}
+	}
+
+	return rollapps, nil
+}
+
+func (q querier) queryGammPools() (*gammPoolsResp, error) {
+	url := fmt.Sprintf("%s/dymensionxyz/dymension/gamm/v1beta1/pools", q.nodeRESTURL)
+	resp, err := get[gammPoolsResp](q.httpClient, url)
+	if err != nil {
+		return nil, fmt.Errorf("query denom metadata: %w", err)
+	}
+	return &resp, nil
 }
 
 func (q querier) queryTokensForDYM(ctx context.Context, planID string, amt sdk.Int) (*sdk.Coin, error) {

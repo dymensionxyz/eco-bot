@@ -52,7 +52,7 @@ func NewBot(cfg config.Config, logger *zap.Logger) (*bot, error) {
 	}
 
 	subscriberId := fmt.Sprintf("subscriber-%s", cfg.Whale.AccountName)
-	q := newQuerier(pmClient, cfg.AnalyticsURL, logger)
+	q := newQuerier(pmClient, cfg.AnalyticsURL, cfg.RollappsURL, cfg.NodeREST, logger)
 	e := newEventer(pmClient.RPC, pmClient.WSEvents, subscriberId, logger)
 	pm := newPositionManager(q, e, cfg.Traders.PositionManageInterval, logger)
 	topUpCh := make(chan topUpRequest, cfg.Traders.Scale)
@@ -83,6 +83,7 @@ func NewBot(cfg config.Config, logger *zap.Logger) (*bot, error) {
 func (b bot) addTrader(
 	keyringDir string,
 	posManageInterval time.Duration,
+	bedtimeStartHour int,
 	logger *zap.Logger,
 	accName string,
 	cClient cosmosclient.Client,
@@ -92,7 +93,10 @@ func (b bot) addTrader(
 	topUpCh chan topUpRequest,
 	q querier,
 	iteratePlans func(f iteratePlanCallback) error,
-	getRanomPlan func(topX int) *iroPlan,
+	iterateRollapps func(callback iterateRollappCallback) error,
+	getRandomPlan func(topX int) *iroPlan,
+	getRandomRollapp func(topX int) *rollapp,
+	removeGammPool func(string),
 ) (*trader, error) {
 	if len(cooldownRangeMinutes) != 2 {
 		return nil, fmt.Errorf("cooldown range must have 2 values")
@@ -120,11 +124,15 @@ func (b bot) addTrader(
 		as,
 		q,
 		iteratePlans,
-		getRanomPlan,
+		iterateRollapps,
+		getRandomPlan,
+		getRandomRollapp,
+		removeGammPool,
 		cClient,
 		setState,
 		getState,
 		posManageInterval,
+		bedtimeStartHour,
 		cooldownRangeMinutes,
 		maxPositions,
 		logger,
@@ -298,10 +306,12 @@ func (b bot) Start(ctx context.Context) {
 		}
 
 		maxPositions := 10 - traderIdx%9
+		bedtimeStartHour := (traderIdx % 4) * 6
 
 		t, err := b.addTrader(
 			b.cfg.Traders.KeyringDir,
 			b.cfg.Traders.PositionManageInterval,
+			bedtimeStartHour,
 			b.logger,
 			acc.Name,
 			cClient,
@@ -311,7 +321,10 @@ func (b bot) Start(ctx context.Context) {
 			b.topUpCh,
 			b.querier,
 			b.pm.iteratePlans,
+			b.pm.iterateRollapps,
 			b.pm.getRandomTopXPlan,
+			b.pm.getRandomTopXRollapp,
+			b.pm.removeGammPool,
 		)
 		if err != nil {
 			b.logger.Error(

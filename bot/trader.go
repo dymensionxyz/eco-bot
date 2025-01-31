@@ -25,8 +25,11 @@ type trader struct {
 	NAV                    sdk.Int // net asset value of all positions in DYM
 	q                      querier
 	iteratePlans           func(iteratePlanCallback) error
-	getRanomPlan           func(topX int) *iroPlan
-	positions              map[uint64]position
+	iterateRollapps        func(callback iterateRollappCallback) error
+	getRandomPlan          func(topX int) *iroPlan
+	getRandomRollapp       func(topX int) *rollapp
+	removeGammPool         func(string)
+	positions              map[string]position
 	getState               func() (*state, error)
 	setState               func(*state) error
 	buy                    func(context.Context, sdk.Int, sdk.Int, string) error
@@ -34,17 +37,10 @@ type trader struct {
 	getBalances            func(context.Context) (sdk.Coins, error)
 	balanceDYM             func() sdk.Int
 	positionManageInterval time.Duration
+	bedtimeStartHour       int
 	cooldownRangeMinutes   []int
 	maxPositions           int
 	logger                 *zap.Logger
-}
-
-type iteratePlanCallback func(plan iroPlan) (bool, error)
-
-type position struct {
-	valueDYM  sdk.Int
-	amount    sdk.Int
-	createdAt time.Time
 }
 
 type cosmosClient interface {
@@ -63,19 +59,29 @@ type plan interface {
 }
 
 var (
-	DYM                 = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
-	standardTargetRaise = sdk.NewDec(10000)
+	DYM                         = sdk.NewIntFromBigInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	standardTargetRaise         = sdk.NewDec(10000)
+	defaultBedtimeDurationHours = 8
+)
+
+const (
+	maxDYMForTrade = 2 // TODO change
+	minDYMForTrade = 1 // TODO change
 )
 
 func newTrader(
 	accountSvc *accountService,
 	q querier,
 	iteratePlans func(iteratePlanCallback) error,
-	getRanomPlan func(int) *iroPlan,
+	iterateRollapps func(callback iterateRollappCallback) error,
+	getRandomPlan func(int) *iroPlan,
+	getRandomRollapp func(int) *rollapp,
+	removeGammPool func(string),
 	cClient cosmosClient,
 	getState func() (*state, error),
 	setState func(*state) error,
 	positionManageInterval time.Duration,
+	bedtimeStartHour int,
 	cooldownRangeMinutes []int,
 	maxPositions int,
 	logger *zap.Logger,
@@ -85,11 +91,15 @@ func newTrader(
 		client:                 cClient,
 		q:                      q,
 		iteratePlans:           iteratePlans,
-		getRanomPlan:           getRanomPlan,
-		positions:              make(map[uint64]position),
+		iterateRollapps:        iterateRollapps,
+		getRandomPlan:          getRandomPlan,
+		getRandomRollapp:       getRandomRollapp,
+		removeGammPool:         removeGammPool,
+		positions:              make(map[string]position),
 		getState:               getState,
 		setState:               setState,
 		positionManageInterval: positionManageInterval,
+		bedtimeStartHour:       bedtimeStartHour,
 		cooldownRangeMinutes:   cooldownRangeMinutes,
 		logger: logger.With(
 			zap.String("trader", accountSvc.accountName),
@@ -150,7 +160,7 @@ func (t *trader) positionsRun(ctx context.Context) error {
 
 	return t.iteratePlans(func(plan iroPlan) (bool, error) {
 		// if position exists for the trader
-		if pos, ok := t.positions[plan.Id]; ok {
+		if pos, ok := t.positions[fmt.Sprint(plan.Id)]; ok {
 			return false, t.manageExistingPosition(
 				ctx, &plan, pos,
 				plan.analyticsResp.Volume.oneDayChangeInPercent(),
@@ -185,15 +195,28 @@ func (t *trader) updatePositions() error {
 		if b.IsPositive() {
 			price := plan.SpotPrice()
 			valueDYM := sdk.NewDecFromInt(b).Mul(price).RoundInt()
-			t.positions[plan.Id] = position{
+			t.positions[fmt.Sprint(plan.Id)] = position{
 				valueDYM: valueDYM,
 				amount:   b,
+				isIRO:    true,
 			}
 			t.NAV = t.NAV.Add(valueDYM)
 		}
 		return false, nil
 	}); err != nil {
 		return fmt.Errorf("failed to iterate plans: %w", err)
+	}
+
+	if err := t.iterateRollapps(func(rollapp rollapp) (bool, error) {
+		b := t.accountSvc.balanceOf(rollapp.IBCDenom)
+		if b.IsPositive() {
+			t.positions[rollapp.ChainID] = position{
+				amount: sdk.NewInt(0),
+			}
+		}
+		return false, nil
+	}); err != nil {
+		return fmt.Errorf("failed to iterate rollapps: %w", err)
 	}
 
 	return nil
@@ -255,7 +278,7 @@ func (t *trader) tryOpenNewPosition(ctx context.Context, plan plan) error {
 		return fmt.Errorf("failed to buy: %w", err)
 	}
 
-	t.positions[plan.GetId()] = position{
+	t.positions[fmt.Sprint(plan.GetId())] = position{
 		valueDYM:  amountToAllocate,
 		amount:    tokenAmount.RoundInt(),
 		createdAt: time.Now(),
@@ -363,7 +386,7 @@ func (t *trader) manageExistingPosition(
 		}
 
 		sellAmt = balances.AmountOf(IRODenom(plan.GetRollappId()))
-		delete(t.positions, planID)
+		delete(t.positions, fmt.Sprint(planID))
 	// If volume decreases >50%, decrease position by 10% of current size.
 	case canTradeVol && oneDayVolumeChangeInPercent <= -50:
 		t.logger.Info("volume decreased >50%, decreasing position by 10%",
@@ -472,61 +495,112 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 		return err
 	}
 
-	positionPlanIDs := make([]uint64, 0, len(t.positions))
-	for planID := range t.positions {
-		positionPlanIDs = append(positionPlanIDs, planID)
+	positionPlanIDs := make([]string, 0, len(t.positions))
+	positionRollappIDs := make([]string, 0, len(t.positions))
+	for id, p := range t.positions {
+		if p.isIRO {
+			positionPlanIDs = append(positionPlanIDs, fmt.Sprint(id))
+		} else {
+			positionRollappIDs = append(positionRollappIDs, fmt.Sprint(id))
+		}
 	}
 
 	slices.Sort(positionPlanIDs)
 
 	t.logger.Info("open positions",
 		zap.Time("next_trade", time.Unix(st.NextTrade, 0)),
-		zap.Uint64s("plan_ids", positionPlanIDs))
+		zap.Strings("plan_ids", positionPlanIDs),
+		zap.Strings("rollapp_ids", positionRollappIDs))
 
-	now := time.Now().Unix()
+	now := time.Now()
+	nowU := now.Unix()
+	bedtimeEndHour := (t.bedtimeStartHour + defaultBedtimeDurationHours) % 24
 
-	if st.NextTrade > now {
-		return nil
+	if now.Hour() >= t.bedtimeStartHour && now.Hour() < bedtimeEndHour {
+		t.logger.Info("bedtime, no trading")
+		//	return nil
 	}
 
-	st.LastTrade = now
+	if st.NextTrade > nowU {
+		//	return nil
+	}
+
+	st.LastTrade = nowU
 	coolDownPeriod := getRandomCooldown(t.cooldownRangeMinutes[0], t.cooldownRangeMinutes[1])
-	st.NextTrade = now + int64(coolDownPeriod.Seconds())
+	st.NextTrade = nowU + int64(coolDownPeriod.Seconds())
 
 	canOpen := len(t.positions) < t.maxPositions
-	pl := t.getRanomPlan(t.maxPositions)
-
-	// if position exists for the trader
-	if _, ok := t.positions[pl.Id]; ok {
-		if err := t.manageRandomPosition(ctx, pl); err != nil {
-			return fmt.Errorf("failed to manage random position: %w", err)
-		}
-
-		if err := t.setState(st); err != nil {
-			return fmt.Errorf("failed to set state: %w", err)
-		}
-
-		return nil
+	if t.positions == nil {
+		t.logger.Info("positions is nil")
 	}
 
-	if !canOpen {
-		return nil
-	}
+	if planOrRollapp := rand.Intn(2); planOrRollapp == 0 {
+		pl := t.getRandomPlan(t.maxPositions)
+		if pl == nil {
+			t.logger.Info("no plans to trade")
+		}
 
-	if err := t.openRandomPosition(ctx, pl); err != nil {
-		return fmt.Errorf("failed to open random position: %w", err)
+		if err := t.tradePlan(ctx, pl, canOpen); err != nil {
+			return fmt.Errorf("failed to trade plan: %w", err)
+		}
+	} else {
+		r := t.getRandomRollapp(t.maxPositions)
+		if r == nil {
+			t.logger.Info("no rollapps to trade")
+		}
+		if err := t.tradeRollapp(ctx, r, canOpen); err != nil {
+			return fmt.Errorf("failed to trade rollapp: %w", err)
+		}
 	}
 
 	if err := t.setState(st); err != nil {
-		t.logger.Error("failed to set state", zap.Error(err))
+		return fmt.Errorf("failed to set state: %w", err)
 	}
 
 	return nil
 }
 
-func (t *trader) openRandomPosition(ctx context.Context, plan *iroPlan) error {
+func (t *trader) tradePlan(ctx context.Context, pl *iroPlan, canOpen bool) error {
+	// if position exists for the trader
+	if _, ok := t.positions[fmt.Sprint(pl.Id)]; ok {
+		if err := t.manageRandomPlanPosition(ctx, pl); err != nil {
+			return fmt.Errorf("failed to manage random position: %w", err)
+		}
+
+		return nil
+	}
+
+	if canOpen {
+		if err := t.openRandomPlanPosition(ctx, pl); err != nil {
+			return fmt.Errorf("failed to open random position: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (t *trader) tradeRollapp(ctx context.Context, r *rollapp, canOpen bool) error {
+	// if position exists for the trader
+	if _, ok := t.positions[r.ChainID]; ok {
+		if err := t.manageRandomRollappPosition(ctx, r); err != nil {
+			return fmt.Errorf("failed to manage random position: %w", err)
+		}
+
+		return nil
+	}
+
+	if canOpen {
+		if err := t.openRandomRollappPosition(ctx, r); err != nil {
+			return fmt.Errorf("failed to open random position: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (t *trader) openRandomPlanPosition(ctx context.Context, plan *iroPlan) error {
 	// get a random amount to buy from 5 to 50 DYM
-	amount := sdk.NewInt(int64(rand.Intn(50) + 5)).Mul(DYM) // from 5 to 50 DYM
+	amount := sdk.NewInt(int64(rand.Intn(maxDYMForTrade) + minDYMForTrade)).Mul(DYM) // from 5 to 50 DYM
 	minAmount, err := plan.MinAmount(amount)
 	if err != nil {
 		return fmt.Errorf("failed to get min amount: %w", err)
@@ -536,7 +610,7 @@ func (t *trader) openRandomPosition(ctx context.Context, plan *iroPlan) error {
 		return fmt.Errorf("failed to buy: %w", err)
 	}
 
-	t.positions[plan.GetId()] = position{
+	t.positions[fmt.Sprint(plan.GetId())] = position{
 		valueDYM:  amount,
 		amount:    minAmount,
 		createdAt: time.Now(),
@@ -545,14 +619,14 @@ func (t *trader) openRandomPosition(ctx context.Context, plan *iroPlan) error {
 	return nil
 }
 
-func (t *trader) manageRandomPosition(
+func (t *trader) manageRandomPlanPosition(
 	ctx context.Context,
 	plan *iroPlan,
 ) error {
 	// buy or sell random amount
 	if rand.Intn(2) == 0 {
 		// buy
-		amount := sdk.NewInt(int64(rand.Intn(50) + 5)).Mul(DYM) // from 5 to 50 DYM
+		amount := sdk.NewInt(int64(rand.Intn(maxDYMForTrade) + minDYMForTrade)).Mul(DYM) // from 5 to 50 DYM
 		minAmount, err := plan.MinAmount(amount)
 		if err != nil {
 			return fmt.Errorf("failed to get min amount: %w", err)
@@ -573,7 +647,7 @@ func (t *trader) manageRandomPosition(
 		sellAmt := totalAmount.Mul(sdk.NewInt(int64(sellAmtPercent))).Quo(sdk.NewInt(100))
 
 		if totalAmount.IsZero() {
-			delete(t.positions, plan.Id)
+			delete(t.positions, fmt.Sprint(plan.Id))
 			return nil
 		}
 
@@ -582,7 +656,7 @@ func (t *trader) manageRandomPosition(
 		}
 
 		if sellAmtPercent == 100 {
-			delete(t.positions, plan.Id)
+			delete(t.positions, fmt.Sprint(plan.Id))
 		}
 	}
 
@@ -649,6 +723,147 @@ func (t *trader) sellAmount(ctx context.Context, amount, minIncome sdk.Int, plan
 	}
 
 	t.logger.Info("sold", zap.String("amount", amount.String()), zap.String("min_income", minIncome.String()))
+
+	// refresh balance
+	if err := t.accountSvc.refreshBalances(ctx); err != nil {
+		return fmt.Errorf("failed to update balances: %w", err)
+	}
+
+	return nil
+}
+
+func (t *trader) openRandomRollappPosition(ctx context.Context, rollapp *rollapp) error {
+	// get a random amount to buy from 5 to 50 DYM
+	amount := sdk.NewInt(int64(rand.Intn(maxDYMForTrade-minDYMForTrade+1) + minDYMForTrade)).Mul(DYM) // from 5 to 50 DYM
+	coin := sdk.NewCoin("adym", amount)
+	minAmount := sdk.NewInt(1) // TODO
+
+	toppedUp, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins(coin))
+	if err != nil {
+		return fmt.Errorf("failed to ensure balances: %w", err)
+	}
+
+	if len(toppedUp) == 0 {
+		t.logger.Info("balances not topped up")
+		return nil
+	}
+
+	if err := t.swapAmount(ctx, coin, minAmount, rollapp.PoolID, rollapp.IBCDenom); err != nil {
+		return fmt.Errorf("failed to buy: %w", err)
+	}
+
+	t.positions[rollapp.ChainID] = position{
+		valueDYM:  amount,
+		amount:    sdk.NewInt(0),
+		createdAt: time.Now(),
+	}
+
+	return nil
+}
+
+func (t *trader) manageRandomRollappPosition(
+	ctx context.Context,
+	rollapp *rollapp,
+) error {
+	// buy or sell random amount
+	if rand.Intn(2) == 0 {
+		// buy
+		amount := sdk.NewInt(int64(rand.Intn(maxDYMForTrade-minDYMForTrade+1) + minDYMForTrade)).Mul(DYM) // from 5 to 50 DYM
+		coin := sdk.NewCoin("adym", amount)
+
+		toppedUp, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins(coin))
+		if err != nil {
+			return fmt.Errorf("failed to ensure balances: %w", err)
+		}
+
+		if len(toppedUp) == 0 {
+			t.logger.Info("balances not topped up")
+			return nil
+		}
+
+		minAmount := sdk.NewInt(1) // TODO
+
+		if err := t.swapAmount(ctx, coin, minAmount, rollapp.PoolID, rollapp.IBCDenom); err != nil {
+			return fmt.Errorf("failed to buy: %w", err)
+		}
+	} else {
+		// sell
+
+		balances, err := t.getBalances(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get account balances: %w", err)
+		}
+
+		totalAmount := balances.AmountOf(rollapp.IBCDenom)
+		sellAmtPercent := rand.Intn(96) + 5 // from 5 to 100%
+		sellAmt := totalAmount.Mul(sdk.NewInt(int64(sellAmtPercent))).Quo(sdk.NewInt(100))
+
+		if totalAmount.IsZero() {
+			delete(t.positions, rollapp.ChainID)
+			return nil
+		}
+
+		// only ensure gas
+		if _, err := t.accountSvc.ensureBalances(ctx, sdk.NewCoins()); err != nil {
+			return fmt.Errorf("failed to ensure balances: %w", err)
+		}
+
+		minAmount := sdk.NewInt(1) // TODO
+		if err := t.swapAmount(ctx, sdk.NewCoin(rollapp.IBCDenom, sellAmt), minAmount, rollapp.PoolID, "adym"); err != nil {
+			return fmt.Errorf("failed to sell: %w", err)
+		}
+
+		if sellAmtPercent == 100 {
+			delete(t.positions, rollapp.ChainID)
+		}
+	}
+
+	return nil
+}
+
+func (t *trader) swapAmount(ctx context.Context, spend sdk.Coin, minAmount sdk.Int, poolId uint64, outDenom string) error {
+	swapMsg := &types.MsgSwapExactAmountIn{
+		Sender: t.accountSvc.address(),
+		Routes: []types.SwapAmountInRoute{{
+			PoolId:        poolId,
+			TokenOutDenom: outDenom,
+		}},
+		TokenIn:           spend,
+		TokenOutMinAmount: minAmount,
+	}
+
+	t.logger.Debug("swapping", zap.String("spend", spend.String()), zap.String("min_amount", minAmount.String()), zap.String("out_denom", outDenom))
+
+	tx, err := t.client.BroadcastTx(t.accountSvc.accountName, swapMsg)
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid calculated result") {
+			t.removeGammPool(outDenom) // TODO: skip rollapp until liquidity provided
+		}
+		return fmt.Errorf("failed to broadcast tx: %w", err)
+	}
+
+	txRes, err := waitForTx(t.accountSvc.client, tx.TxHash)
+	if err != nil {
+		return fmt.Errorf("failed to wait for tx: %w", err)
+	}
+
+	var tokensOut string
+
+	for _, ev := range txRes.TxResponse.Events {
+		if ev.Type == "token_swapped" {
+			for _, attr := range ev.Attributes {
+				if string(attr.Key) == "tokens_out" {
+					tOut, err := sdk.ParseCoinNormalized(string(attr.Value))
+					if err != nil {
+						t.logger.Error("failed to parse tokens out", zap.Error(err))
+					}
+					tokensOut = tOut.String()
+				}
+			}
+		}
+	}
+
+	t.logger.Info("swapped", zap.String("spend", spend.String()), zap.String("out", tokensOut))
 
 	// refresh balance
 	if err := t.accountSvc.refreshBalances(ctx); err != nil {
