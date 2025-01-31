@@ -518,11 +518,11 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 
 	if now.Hour() >= t.bedtimeStartHour && now.Hour() < bedtimeEndHour {
 		t.logger.Info("bedtime, no trading")
-		//	return nil
+		return nil
 	}
 
 	if st.NextTrade > nowU {
-		//	return nil
+		return nil
 	}
 
 	st.LastTrade = nowU
@@ -538,6 +538,7 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 		pl := t.getRandomPlan(t.maxPositions)
 		if pl == nil {
 			t.logger.Info("no plans to trade")
+			return nil
 		}
 
 		if err := t.tradePlan(ctx, pl, canOpen); err != nil {
@@ -547,6 +548,7 @@ func (t *trader) buyAndSellRandomly(ctx context.Context) error {
 		r := t.getRandomRollapp(t.maxPositions)
 		if r == nil {
 			t.logger.Info("no rollapps to trade")
+			return nil
 		}
 		if err := t.tradeRollapp(ctx, r, canOpen); err != nil {
 			return fmt.Errorf("failed to trade rollapp: %w", err)

@@ -1,11 +1,12 @@
 log_level: debug
 node_address: "https://dymension-mainnet-tendermint.blastapi.io:443/291f79ab-77c1-4c90-b769-8218b1816f5c"
+node_rest: "https://dymension-mainnet-rest.blastapi.io/291f79ab-77c1-4c90-b769-8218b1816f5c"
 analytics_url: "https://fetchnetworkdataitemrequest-xqbg2swtrq-uc.a.run.app"
 
 whale:
     account_name: whale
     keyring_backend: test
-    keyring_dir: /Users/aleksandarsukovic/.dymension
+    keyring_dir: /Users/aleksandar.sukovic/.dymension
     num_intermediary_accounts: 20
 
 gas:
@@ -14,7 +15,7 @@ gas:
 
 traders:
     keyring_backend: test
-    keyring_dir: /Users/aleksandarsukovic/.order-client1
+    keyring_dir: /Users/aleksandar.sukovic/.order-client1
     scale: 100
     time_to_scale: 96h
     scale_delay_ratio: 2.0
